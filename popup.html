@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BulkyGen</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+
+<body>
+  <!-- ─── Header ─────────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <img src="icons/BulkyGen.png" class="logo" alt="BulkyGen" />
+      <div>
+        <span class="app-name">BulkyGen</span>
+        <span class="mode-badge" id="modeLabel">Manual</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
+      <button class="icon-btn" id="closeBtn" title="Close">✕</button>
+    </div>
+  </header>
+
+  <!-- ─── Status bar ─────────────────────────────────────────────── -->
+  <div class="status-bar" id="statusBar">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Idle</span>
+  </div>
+
+  <!-- ─── Current Prompt ─────────────────────────────────────────── -->
+  <div class="current-prompt-card" id="currentPromptCard">
+    <div class="current-prompt-label">Current Prompt</div>
+    <div class="current-prompt-text" id="currentPromptText">—</div>
+    <div class="progress-bar-wrap" id="progressWrap" style="display:none">
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progressFill"></div>
+      </div>
+      <span class="progress-eta" id="progressEta"></span>
+    </div>
+  </div>
+
+  <!-- ─── Stats grid ─────────────────────────────────────────────── -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-value" id="statToday">0</div>
+      <div class="stat-label">Today</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="statLifetime">0</div>
+      <div class="stat-label">Lifetime</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="statFailed">0</div>
+      <div class="stat-label">Failed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="statQueue">0</div>
+      <div class="stat-label">Queued</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="statAvgTime">—</div>
+      <div class="stat-label">Avg Time</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="statETA">—</div>
+      <div class="stat-label">ETA</div>
+    </div>
+  </div>
+
+  <!-- ─── Last completed image ───────────────────────────────────── -->
+  <div class="last-image-section" id="lastImageSection" style="display:none">
+    <div class="section-title">Last Generated</div>
+    <div class="last-image-row">
+      <img class="last-thumb" id="lastThumb" src="" alt="Last generated" />
+      <div class="last-meta">
+        <div class="last-prompt" id="lastPrompt"></div>
+        <div class="last-time" id="lastTime"></div>
+        <a class="last-drive-link" id="lastDriveLink" href="#" target="_blank" rel="noopener" style="display:none">
+          ↗ Open in Drive
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Controls ───────────────────────────────────────────────── -->
+  <div class="controls">
+    <!-- Autonomous mode controls -->
+    <div class="autonomous-controls" id="autonomousControls" style="display:none">
+      <button class="btn btn-start" id="startAutoBtn">▶ Start</button>
+      <button class="btn btn-stop" id="stopAutoBtn" disabled>⏹ Stop</button>
+    </div>
+
+    <!-- Manual mode controls (original queue+generate) -->
+    <div class="manual-controls" id="manualControls">
+      <div class="manual-notice">
+        <span>💡</span>
+        <div>
+          <strong>Manual mode – </strong>Enable <em>Autonomous Mode</em> in settings to pull prompts from Supabase
+          automatically.
+        </div>
+      </div>
+      <div class="field-group">
+        <label for="generatorSelect">Generator</label>
+        <select id="generatorSelect" class="select-input">
+          <option value="flow">Google Flow</option>
+          <option value="metaai">Meta AI</option>
+          <option value="grok">Grok</option>
+          <option value="digen">DIGEN AI</option>
+          <option value="gentube">Gentube</option>
+          <option value="firefly">Firefly</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label for="promptInput">Prompts <span class="hint-inline">(one per line)</span></label>
+        <textarea id="promptInput" rows="4"
+          placeholder="A serene mountain lake at sunset&#10;A futuristic city at night&#10;..."></textarea>
+      </div>
+      <div class="field-row">
+        <div class="field-group">
+          <label for="delayInput">Delay (s)</label>
+          <input id="delayInput" type="number" min="0" step="1" value="3" />
+        </div>
+        <button class="btn btn-primary" id="goToGeneratorBtn" title="Navigate to generator">↗ Open</button>
+      </div>
+      <div class="manual-btn-row">
+        <button class="btn btn-start" id="startBtn">▶ Start</button>
+        <button class="btn btn-pause" id="pauseBtn" style="display:none">⏸ Pause</button>
+        <button class="btn btn-stop" id="stopBtn" disabled>⏹ Stop</button>
+        <button class="btn btn-ghost" id="clearBtn">✕ Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Queue (manual mode) ────────────────────────────────────── -->
+  <div class="queue-section" id="queueSection">
+    <div class="section-title-row">
+      <div class="section-title">Queue</div>
+      <button class="btn btn-ghost-sm" id="downloadZipBtn" disabled>📦 ZIP</button>
+    </div>
+    <div class="queue-list" id="queueList">
+      <div class="empty-queue">No prompts in queue</div>
+    </div>
+  </div>
+
+  <!-- ─── Error log ───────────────────────────────────────────────── -->
+  <div class="error-log-section" id="errorSection" style="display:none">
+    <div class="section-title">Recent Errors</div>
+    <div class="error-list" id="errorList"></div>
+  </div>
+
+  <!-- ─── Footer ─────────────────────────────────────────────────── -->
+  <footer class="footer">
+    <button class="footer-btn" id="resetSeqBtn" title="Reset download counter">⟳ Seq</button>
+    <button class="footer-btn" id="clearImagesBtn">🗑 Clear Images</button>
+    <button class="footer-btn" id="donateBtn">💜 Donate</button>
+  </footer>
+
+  <!-- ─── Image modal ─────────────────────────────────────────────── -->
+  <div class="modal-backdrop" id="imageModal" aria-hidden="true" style="display:none">
+    <div class="modal">
+      <button class="modal-close" data-action="close">✕</button>
+      <img id="modalImage" src="" alt="Generated image" />
+      <div class="modal-thumbs" id="modalThumbs"></div>
+    </div>
+  </div>
+
+  <!-- ─── Donate modal ────────────────────────────────────────────── -->
+  <div class="modal-backdrop" id="donateModal" aria-hidden="true" style="display:none">
+    <div class="modal donate-modal">
+      <button class="modal-close" data-action="close-donate">✕</button>
+      <h3>Support BulkyGen 💜</h3>
+      <p>If BulkyGen saves you time, consider supporting development!</p>
+      <button class="btn btn-primary" id="buyCodeBtn">🛒 Get License</button>
+    </div>
+  </div>
+
+  <script src="ext.js"></script>
+  <script src="image_store.js"></script>
+  <script src="modules/logger.js"></script>
+  <script src="modules/settings.js"></script>
+  <script src="modules/statistics.js"></script>
+  <script src="modules/supabase.js"></script>
+  <script src="popup.js"></script>
+</body>
+
+</html>

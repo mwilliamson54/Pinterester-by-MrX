@@ -1,0 +1,161 @@
+{
+   "action": {
+      "default_icon": {
+         "128": "icons/BulkyGen.png",
+         "16": "icons/BulkyGen.png",
+         "32": "icons/BulkyGen.png",
+         "48": "icons/BulkyGen.png"
+      }
+   },
+   "background": {
+      "service_worker": "background.js"
+   },
+   "content_scripts": [
+      {
+         "all_frames": true,
+         "js": [
+            "inject_visibility.js"
+         ],
+         "matches": [
+            "https://labs.google/fx/tools/flow/*",
+            "https://meta.ai/*",
+            "https://www.meta.ai/*",
+            "https://grok.com/*",
+            "https://digen.ai/*",
+            "https://gentube.app/*",
+            "https://www.gentube.app/*",
+            "https://firefly.adobe.com/*"
+         ],
+         "run_at": "document_start",
+         "world": "MAIN"
+      },
+      {
+         "js": [
+            "ext.js",
+            "content.js"
+         ],
+         "matches": [
+            "https://labs.google/fx/tools/flow/*",
+            "https://meta.ai/*",
+            "https://www.meta.ai/*",
+            "https://grok.com/*",
+            "https://digen.ai/*",
+            "https://gentube.app/*",
+            "https://www.gentube.app/*",
+            "https://firefly.adobe.com/*"
+         ],
+         "run_at": "document_idle"
+      }
+   ],
+   "description": "Queue a list of prompts and generate them automatically, one line at a time, on supported AI image and video generator sites.",
+   "host_permissions": [
+      "https://labs.google/*",
+      "https://meta.ai/*",
+      "https://www.meta.ai/*",
+      "https://grok.com/*",
+      "https://*.grok.com/*",
+      "https://assets.grok.com/*",
+      "https://imagine-public.x.ai/*",
+      "https://*.x.ai/*",
+      "https://*.wasabisys.com/*",
+      "https://*.amazonaws.com/*",
+      "https://*.fbsbx.com/*",
+      "https://*.fbcdn.net/*",
+      "https://*.facebook.com/*",
+      "https://*.twimg.com/*",
+      "https://*.r2.dev/*",
+      "https://digen.ai/*",
+      "https://gentube.app/*",
+      "https://www.gentube.app/*",
+      "https://*.cloudfront.net/*",
+      "https://*.cloudflare.com/*",
+      "https://*.digen.ai/*",
+      "https://firefly.adobe.com/*",
+      "https://*.adobe.com/*",
+      "https://*.adobe.io/*",
+      "https://*.adobestatic.com/*",
+      "https://*.adobesc.com/*",
+      "https://*.adobess.com/*",
+      "https://*.sensei.adobe.io/*",
+      "https://*.supabase.co/*",
+      "https://*.supabase.io/*",
+      "https://www.googleapis.com/*",
+      "https://oauth2.googleapis.com/*",
+      "https://www.googleapis.com/upload/*"
+   ],
+   "icons": {
+      "128": "icons/BulkyGen.png",
+      "16": "icons/BulkyGen.png",
+      "32": "icons/BulkyGen.png",
+      "48": "icons/BulkyGen.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmKRI7Pdg+eDr+etn+UzGsouNOPZJmeKXB5q43Bgl5yzZ/sCk9Ikg4/MufRNDH6ikGU8P9LXNytpyOF19xClnEYEraAMZmsGsFt08uzqZFXQrMuRuK62ZLxc7WolR9nvcuz5KCvxMhGFlwH75fc2sG1CWEYC9JpWHtsBrWSTeU0Ggg/6T3TF7FL9GS3KLj0lc/2b4hLbuZ2z0jUucRPahp/Tcru7gz8aoTmpLTiKo0A+f/mO7HHEu2347hfrskFqqX8JDYn1NW3anvU8MDNG9QqVtKly4SmfN8dp2roFiU+yfWUt/YwKzDB6YDkgueGUSAo+MOAvCvxQybSqHNU/LsQIDAQAB",
+   "manifest_version": 3,
+   "name": "BulkyGen- Flow Automation",
+   "options_page": "settings.html",
+   "permissions": [
+      "alarms",
+      "activeTab",
+      "scripting",
+      "storage",
+      "downloads",
+      "sidePanel",
+      "unlimitedStorage",
+      "identity",
+      "offscreen"
+   ],
+   "side_panel": {
+      "default_path": "popup.html"
+   },
+   "oauth2": {
+      "client_id": "357290281456-ao2billijupnvco93tdp6ltbhhe6jbln.apps.googleusercontent.com",
+      "scopes": [
+         "https://www.googleapis.com/auth/drive.file",
+         "https://www.googleapis.com/auth/userinfo.email"
+      ]
+   },
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "2.7.0",
+   "web_accessible_resources": [
+      {
+         "matches": [
+            "https://labs.google/*",
+            "https://meta.ai/*",
+            "https://www.meta.ai/*",
+            "https://grok.com/*",
+            "https://digen.ai/*",
+            "https://gentube.app/*",
+            "https://www.gentube.app/*",
+            "https://firefly.adobe.com/*"
+         ],
+         "resources": [
+            "inject_visibility.js",
+            "popup.html",
+            "popup.css",
+            "popup.js",
+            "image_store.js",
+            "ext.js",
+            "icons/*",
+            "modules/logger.js",
+            "modules/settings.js",
+            "modules/statistics.js",
+            "modules/supabase.js",
+            "modules/googleAuth.js",
+            "modules/googleDrive.js",
+            "modules/gpu-filters.js",
+            "modules/canvas-processor.js",
+            "modules/metadata/piexif.js",
+            "modules/metadata/metadata-mapper.js",
+            "modules/metadata/xmp-serializer.js",
+            "modules/metadata/exif-serializer.js",
+            "modules/metadata/iptc-serializer.js",
+            "modules/metadata/metadata-engine.js",
+            "modules/metadata-writer.js",
+            "modules/pipeline.js",
+            "settings.html",
+            "settings.css",
+            "settings-page.js"
+         ]
+      }
+   ]
+}

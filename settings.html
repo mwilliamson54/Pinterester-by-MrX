@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BulkyGen Settings</title>
+    <link rel="stylesheet" href="settings.css" />
+</head>
+
+<body>
+    <div class="page-wrap">
+        <header class="page-header">
+            <img src="icons/BulkyGen.png" class="logo" alt="BulkyGen" />
+            <div>
+                <h1>BulkyGen Settings</h1>
+                <p class="subtitle">Configure Supabase, Google Drive, and generation options</p>
+            </div>
+        </header>
+
+        <!-- ───────────────────────────── GENERAL & SUPABASE ─────────────────────── -->
+        <section class="card" id="section-supabase">
+            <h2 class="card-title">
+                <span class="card-icon">🗄️</span> Supabase Connection
+            </h2>
+
+            <!-- Configuration Mode Toggle -->
+            <div class="field-group mb16">
+                <label>Configuration Mode</label>
+                <div class="radio-group" style="display: flex; gap: 1rem; margin-top: 4px;">
+                    <label style="cursor: pointer;">
+                        <input type="radio" name="configMode" value="preconfigured" checked />
+                        Pre-configured Settings
+                    </label>
+                    <label style="cursor: pointer;">
+                        <input type="radio" name="configMode" value="manual" />
+                        Manual Configuration
+                    </label>
+                </div>
+            </div>
+
+            <!-- Pre-configured Message -->
+            <div id="preconfiguredMsg" class="notice info mb16">
+                Using built-in, hardcoded Supabase credentials and table <strong>images_queue</strong>. No setup required.
+            </div>
+
+            <!-- Manual Credentials (Hidden by default) -->
+            <div id="manualCredentials" style="display: none;">
+                <div class="field-group">
+                    <label for="supabaseUrl">Project URL <span style="color:var(--accent-err,#f87171);font-size:0.8em;">*required</span></label>
+                    <input id="supabaseUrl" type="url" placeholder="https://xxxxxxxxxxxx.supabase.co" autocomplete="off" required />
+                    <span class="hint">Found in Supabase → Project Settings → API</span>
+                </div>
+
+                <div class="field-group">
+                    <label for="supabaseAnonKey">Anon / Public Key <span style="color:var(--accent-err,#f87171);font-size:0.8em;">*required</span></label>
+                    <input id="supabaseAnonKey" type="password" placeholder="eyJ..." autocomplete="off" required />
+                    <button class="icon-btn" id="toggleAnonKey" title="Show/hide key">👁</button>
+                    <span class="hint">Public anon key — safe to use in extensions</span>
+                </div>
+
+                <div class="field-row">
+                    <div class="field-group">
+                        <label for="supabaseTable">Table Name <span style="color:var(--accent-err,#f87171);font-size:0.8em;">*required</span></label>
+                        <input id="supabaseTable" type="text" placeholder="images_queue" required />
+                        <span class="hint">The Supabase table that holds your image queue.</span>
+                    </div>
+                    <div class="field-group">
+                        <label for="pollIntervalMs">Poll Interval (ms)</label>
+                        <input id="pollIntervalMs" type="number" min="1000" step="1000" placeholder="5000" />
+                    </div>
+                </div>
+            </div>
+
+            <!-- Poll Interval (Preconfigured mode — table is hidden/hardcoded) -->
+            <div id="preconfiguredCommon">
+                <div class="field-group" style="max-width:180px;">
+                    <label for="pollIntervalMsPre">Poll Interval (ms)</label>
+                    <input id="pollIntervalMsPre" type="number" min="1000" step="1000" placeholder="5000" />
+                    <span class="hint">How often to check for new queue items.</span>
+                </div>
+            </div>
+
+            <!-- Device Tracking -->
+            <div class="field-group mt8">
+                <label for="deviceName">Device Name</label>
+                <input id="deviceName" type="text" placeholder="e.g. My Mac Studio" />
+                <span class="hint">Identifies this machine in the Supabase records to track generated images by device.</span>
+            </div>
+
+            <div class="action-row mt12">
+                <button class="btn btn-secondary" id="testSupabase">🔌 Test Connection</button>
+                <span class="test-result" id="supabaseTestResult"></span>
+            </div>
+        </section>
+
+
+        <!-- ───────────────────────────── AUTONOMOUS MODE ────────────────────────── -->
+        <section class="card" id="section-auto">
+            <h2 class="card-title">
+                <span class="card-icon">🤖</span> Autonomous Mode
+            </h2>
+
+            <div class="toggle-row">
+                <label class="toggle">
+                    <input type="checkbox" id="autonomousMode" />
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Enable Autonomous Mode</span>
+                <span class="hint ml8">When on, the extension automatically polls Supabase and generates images without
+                    any user input.</span>
+            </div>
+
+            <div class="toggle-row mt8">
+                <label class="toggle">
+                    <input type="checkbox" id="pauseOnError" />
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Pause on first error</span>
+                <span class="hint ml8">Stop the loop if a record fails (instead of continuing to next)</span>
+            </div>
+
+            <div class="field-row mt12">
+                <div class="field-group">
+                    <label for="maxRetries">Max Retries per Record</label>
+                    <input id="maxRetries" type="number" min="0" max="20" placeholder="5" />
+                </div>
+                <div class="field-group">
+                    <label for="retryBaseMs">Retry Base Delay (ms)</label>
+                    <input id="retryBaseMs" type="number" min="500" step="500" placeholder="2000" />
+                </div>
+                <div class="field-group">
+                    <label for="retryMaxMs">Retry Max Delay (ms)</label>
+                    <input id="retryMaxMs" type="number" min="5000" step="5000" placeholder="60000" />
+                </div>
+            </div>
+        </section>
+
+        <!-- ───────────────────────────── IMAGE PROCESSING ───────────────────────── -->
+        <section class="card" id="section-image">
+            <h2 class="card-title">
+                <span class="card-icon">🖼️</span> Image Processing
+            </h2>
+
+            <div class="field-group">
+                <label for="jpegQuality">JPEG Quality: <span id="jpegQualityVal">90%</span></label>
+                <input id="jpegQuality" type="range" min="0.70" max="1.00" step="0.05" value="0.90" />
+                <div class="range-labels"><span>70%</span><span>85%</span><span>100%</span></div>
+                <span class="hint">Images are re-encoded as JPEG, stripping all original metadata. Higher quality =
+                    larger file size.</span>
+            </div>
+        </section>
+
+        <!-- ─────────────────────────────── WATERMARK ─────────────────────────────── -->
+        <section class="card" id="section-watermark">
+            <h2 class="card-title">
+                <span class="card-icon">💧</span> Watermark
+            </h2>
+            <span class="hint">Global watermark defaults. Per-record Supabase fields always take priority over these.</span>
+
+            <div class="toggle-row mt8">
+                <label class="toggle">
+                    <input type="checkbox" id="watermarkEnabled" />
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Enable Watermark</span>
+            </div>
+
+            <div id="watermarkFields" class="drive-fields">
+                <div class="field-row mt12">
+                    <div class="field-group">
+                        <label for="watermarkText">Watermark Text</label>
+                        <input id="watermarkText" type="text" placeholder="© Your Brand" />
+                        <span class="hint">Leave blank to disable text watermark.</span>
+                    </div>
+                    <div class="field-group">
+                        <label for="watermarkLogoUrl">Logo Data URL</label>
+                        <input id="watermarkLogoUrl" type="text" placeholder="data:image/png;base64,..." />
+                        <span class="hint">Paste a base64 data URL for a logo image overlay.</span>
+                    </div>
+                </div>
+
+                <div class="field-row mt8">
+                    <div class="field-group">
+                        <label for="watermarkPosition">Position</label>
+                        <select id="watermarkPosition">
+                            <option value="top-left">Top Left</option>
+                            <option value="top-center">Top Center</option>
+                            <option value="top-right">Top Right</option>
+                            <option value="center-left">Center Left</option>
+                            <option value="center">Center</option>
+                            <option value="center-right">Center Right</option>
+                            <option value="bottom-left">Bottom Left</option>
+                            <option value="bottom-center">Bottom Center</option>
+                            <option value="bottom-right" selected>Bottom Right</option>
+                        </select>
+                    </div>
+                    <div class="field-group">
+                        <label for="watermarkFont">Font</label>
+                        <input id="watermarkFont" type="text" placeholder="24px sans-serif" />
+                        <span class="hint">CSS font string, e.g. <code>18px Arial</code></span>
+                    </div>
+                </div>
+
+                <div class="field-row mt8">
+                    <div class="field-group">
+                        <label for="watermarkOpacity">Opacity: <span id="watermarkOpacityVal">30%</span></label>
+                        <input id="watermarkOpacity" type="range" min="0.05" max="1.00" step="0.05" value="0.30" />
+                        <div class="range-labels"><span>5%</span><span>50%</span><span>100%</span></div>
+                    </div>
+                    <div class="field-group">
+                        <label for="watermarkScale">Scale: <span id="watermarkScaleVal">1.0×</span></label>
+                        <input id="watermarkScale" type="range" min="0.25" max="3.00" step="0.25" value="1.00" />
+                        <div class="range-labels"><span>0.25×</span><span>1.5×</span><span>3×</span></div>
+                    </div>
+                </div>
+
+                <div class="field-row mt8">
+                    <div class="field-group">
+                        <label for="watermarkRotation">Rotation (degrees)</label>
+                        <input id="watermarkRotation" type="number" min="-180" max="180" step="1" placeholder="0" />
+                    </div>
+                    <div class="field-group">
+                        <label for="watermarkMargin">Margin (px)</label>
+                        <input id="watermarkMargin" type="number" min="0" max="200" step="1" placeholder="20" />
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ─────────────────────────────── METADATA EMBEDDING ──────────────────────── -->
+        <section class="card" id="section-metadata">
+            <h2 class="card-title">
+                <span class="card-icon">🏷️</span> Metadata Embedding
+            </h2>
+            <span class="hint">These values are written into EXIF/IPTC/XMP fields of every generated JPEG. Per-record Supabase fields always take priority.</span>
+
+            <div class="toggle-row mt8">
+                <label class="toggle">
+                    <input type="checkbox" id="metadataEnabled" checked />
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Enable Metadata Embedding</span>
+            </div>
+
+            <div id="metadataFields" class="drive-fields mt12">
+                <div class="field-row">
+                    <div class="field-group">
+                        <label for="metadataTitle">Default Title</label>
+                        <input id="metadataTitle" type="text" placeholder="My AI Artwork" />
+                    </div>
+                    <div class="field-group">
+                        <label for="metadataAuthor">Author / Creator</label>
+                        <input id="metadataAuthor" type="text" placeholder="Your Name" />
+                    </div>
+                </div>
+
+                <div class="field-group mt8">
+                    <label for="metadataDescription">Default Description</label>
+                    <input id="metadataDescription" type="text" placeholder="AI-generated image created with BulkyGen" />
+                </div>
+
+                <div class="field-group mt8">
+                    <label for="metadataKeywords">Default Keywords</label>
+                    <input id="metadataKeywords" type="text" placeholder="ai, art, generated, flow" />
+                    <span class="hint">Comma-separated list of keywords for IPTC and XMP.</span>
+                </div>
+
+                <div class="field-row mt8">
+                    <div class="field-group">
+                        <label for="metadataCopyright">Copyright Notice</label>
+                        <input id="metadataCopyright" type="text" placeholder="© 2025 Your Name. All rights reserved." />
+                    </div>
+                    <div class="field-group">
+                        <label for="metadataWebsite">Website / URL</label>
+                        <input id="metadataWebsite" type="url" placeholder="https://yourwebsite.com" />
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ───────────────────────────── GOOGLE DRIVE ───────────────────────────── -->
+        <section class="card" id="section-drive">
+            <h2 class="card-title">
+                <span class="card-icon">☁️</span> Google Drive
+            </h2>
+
+            <div class="toggle-row">
+                <label class="toggle">
+                    <input type="checkbox" id="driveEnabled" />
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Enable Google Drive</span>
+            </div>
+
+            <div id="driveFields" class="drive-fields mt12">
+                <!-- Authentication Status UI -->
+                <div id="driveAuthUI" class="notice info mb16" style="display: flex; flex-direction: column; gap: 8px;">
+                    <div id="driveStatusText"><strong>Storage Status:</strong> Checking...</div>
+                    <div id="driveEmailText" style="display: none;"><strong>Connected as:</strong> <span id="driveUserEmail"></span></div>
+                    <div style="margin-top: 8px;">
+                        <button class="btn btn-secondary" id="authDriveConnectBtn" style="display: none;">🔗 Connect Google Drive</button>
+                        <button class="btn btn-ghost" id="authDriveDisconnectBtn" style="display: none;">Disconnect</button>
+                    </div>
+                </div>
+
+                <!-- Drive Settings (only shown when connected) -->
+                <div id="driveSettingsUI" style="display: none;">
+                    <div class="field-group mt8">
+                        <label for="driveFolderId">Drive Folder ID</label>
+                        <input id="driveFolderId" type="text" placeholder="1BxiMVs0XRA5nFMdKvBdBZjg..." />
+                        <span class="hint">The ID from the folder's URL. E.g. drive.google.com/drive/folders/<strong>FOLDER_ID</strong></span>
+                    </div>
+
+                    <div class="field-group">
+                        <label for="driveNamingTemplate">File Naming Template</label>
+                        <input id="driveNamingTemplate" type="text" placeholder="{index}-{date}" />
+                        <span class="hint">Tokens: <code>{index}</code> <code>{date}</code> <code>{prompt}</code> <code>{id}</code></span>
+                    </div>
+
+                    <div class="toggle-row">
+                        <label class="toggle">
+                            <input type="checkbox" id="driveAutoFolder" />
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">Auto-create subfolders from Supabase "folder" column</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ───────────────────────────── DEBUG ──────────────────────────────────── -->
+        <section class="card" id="section-debug">
+            <h2 class="card-title">
+                <span class="card-icon">🐛</span> Debug
+            </h2>
+
+            <div class="field-row">
+                <div class="field-group">
+                    <label for="logLevel">Log Level</label>
+                    <select id="logLevel">
+                        <option value="verbose">Verbose (all logs)</option>
+                        <option value="info" selected>Info</option>
+                        <option value="warn">Warnings only</option>
+                        <option value="error">Errors only</option>
+                    </select>
+                </div>
+                <div class="field-group">
+                    <label>&nbsp;</label>
+                    <div class="toggle-row">
+                        <label class="toggle">
+                            <input type="checkbox" id="debugMode" />
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">Debug Mode (extra console output)</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="action-row mt12">
+                <button class="btn btn-secondary" id="copyLogsBtn">📋 Copy Logs</button>
+                <button class="btn btn-ghost" id="clearLogsBtn">🗑 Clear Logs</button>
+                <span class="test-result" id="logsActionResult"></span>
+            </div>
+        </section>
+
+        <!-- ───────────────────────────── FOOTER ACTIONS ─────────────────────────── -->
+        <footer class="page-footer">
+            <button class="btn btn-primary" id="saveBtn">💾 Save Settings</button>
+            <button class="btn btn-ghost" id="resetBtn">↺ Reset to Defaults</button>
+            <span class="save-status" id="saveStatus"></span>
+        </footer>
+    </div>
+
+    <script src="ext.js"></script>
+    <script src="modules/logger.js"></script>
+    <script src="modules/settings.js"></script>
+    <script src="modules/supabase.js"></script>
+    <script src="modules/googleAuth.js"></script>
+    <script src="modules/googleDrive.js"></script>
+    <script src="settings-page.js"></script>
+</body>
+
+</html>

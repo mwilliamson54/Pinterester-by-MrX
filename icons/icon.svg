@@ -1,0 +1,10 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <rect width="128" height="128" fill="#000000" rx="24"/>
+  <g transform="translate(24, 24)">
+    <!-- Fire icon -->
+    <path d="M40 70 C40 70, 35 60, 35 50 C35 40, 40 30, 40 30 C40 30, 35 35, 35 40 C35 45, 40 50, 40 50 C40 50, 45 40, 45 30 C45 20, 40 10, 40 0 C40 0, 50 10, 55 20 C60 30, 60 40, 60 50 C60 60, 55 70, 40 70 Z" fill="#ffffff" opacity="0.9"/>
+    <circle cx="40" cy="55" r="8" fill="#000000"/>
+  </g>
+  <!-- Lightning bolt for "auto" -->
+  <path d="M75 45 L70 60 L78 60 L73 75 L83 57 L77 57 L82 45 Z" fill="#ffffff" opacity="0.8"/>
+</svg>
