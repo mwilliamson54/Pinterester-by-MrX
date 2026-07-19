@@ -57,13 +57,22 @@ if (typeof chrome !== 'undefined' && chrome.alarms && chrome.alarms.onAlarm) {
   chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM) return;
     try {
-      const data = await ext.storage.local.get(['isRunning', 'isPaused', 'genTabId']);
-      if (data.isRunning && !loopActive) {
+      const data = await ext.storage.local.get(['isRunning', 'isPaused', 'genTabId', 'pipelineRunning']);
+
+      // Resurrect the autonomous pipeline if the worker was killed mid-run.
+      // (bulkygenPipeline.isRunning lives in memory, so after a worker restart
+      // it's always false even though pipelineRunning in storage says it should
+      // still be active — that mismatch is exactly the "worker got killed" signal.)
+      if (data.pipelineRunning && globalThis.bulkygenPipeline && !globalThis.bulkygenPipeline.isRunning) {
+        startSwKeepAlive();
+        console.log('\u23f0 Watchdog: resuming autonomous pipeline after worker wake');
+        globalThis.bulkygenPipeline.start(true);
+      } else if (!data.pipelineRunning && data.isRunning && !loopActive) {
         startSwKeepAlive();
         isPaused = !!data.isPaused;
         console.log('\u23f0 Watchdog: resuming generation after worker wake');
         startGeneration(typeof data.genTabId === 'number' ? data.genTabId : undefined);
-      } else if (!data.isRunning) {
+      } else if (!data.isRunning && !data.pipelineRunning) {
         disarmKeepAliveAlarm();
         stopSwKeepAlive();
       }
@@ -73,8 +82,12 @@ if (typeof chrome !== 'undefined' && chrome.alarms && chrome.alarms.onAlarm) {
 
 // Re-arm keep-alive whenever the worker spins back up while a run is active.
 try {
-  ext.storage.local.get(['isRunning']).then((d) => {
-    if (d && d.isRunning) { startSwKeepAlive(); armKeepAliveAlarm(); }
+  ext.storage.local.get(['isRunning', 'pipelineRunning']).then((d) => {
+    if (d && (d.isRunning || d.pipelineRunning)) { startSwKeepAlive(); armKeepAliveAlarm(); }
+    if (d && d.pipelineRunning && globalThis.bulkygenPipeline && !globalThis.bulkygenPipeline.isRunning) {
+      console.log('\u23f0 Startup: resuming autonomous pipeline after worker restart');
+      globalThis.bulkygenPipeline.start(true);
+    }
   }).catch(() => { });
 } catch (e) { }
 
@@ -94,7 +107,14 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startGeneration') {
-    startGeneration();
+    if (loopActive) {
+      console.warn('BulkyGen: startGeneration ignored — a generation loop is already active in this worker (loopActive=true). This is why a pipeline record can hang until its 300s timeout with no logs at all.');
+      sendResponse({ started: false, reason: 'loopActive' });
+      return false;
+    }
+    startGeneration().catch((e) => console.error('startGeneration error:', e));
+    sendResponse({ started: true });
+    return false;
   } else if (message.action === 'stopGeneration') {
     isRunning = false;
     isPaused = false;
@@ -117,6 +137,12 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   } else if (message.action === 'startPipeline') {
     if (globalThis.bulkygenPipeline) {
+      // Without this, the service worker can be torn down mid-generation
+      // (Flow waits can run for minutes) and nothing was resurrecting the
+      // autonomous loop — this is what caused it to silently stop.
+      startSwKeepAlive();
+      armKeepAliveAlarm();
+      ext.storage.local.set({ pipelineRunning: true }).catch(() => { });
       globalThis.bulkygenPipeline.start(true); // force=true: bypass autonomousMode check
       sendResponse({ success: true });
     } else {
@@ -126,6 +152,9 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'stopPipeline') {
     if (globalThis.bulkygenPipeline) {
       globalThis.bulkygenPipeline.stop();
+      ext.storage.local.set({ pipelineRunning: false }).catch(() => { });
+      stopSwKeepAlive();
+      disarmKeepAliveAlarm();
       sendResponse({ success: true });
     } else {
       sendResponse({ success: false, error: 'Pipeline module not loaded' });
@@ -278,6 +307,23 @@ function isSupportedTabUrl(url) {
          (url.includes('firefly.adobe.com') && url.includes('/generate'));
 }
 
+// If startGeneration() fails before it ever reaches the per-item generation
+// loop (no supported tab found, page check failed, etc.), the pipeline was
+// previously left hanging for the full 300s timeout with zero information —
+// these early-exit branches only called notifyPopup(), which the pipeline
+// doesn't listen to. This reports the failure directly so it fails fast.
+async function _reportPipelineStartFailure(reason) {
+  try {
+    const data = await ext.storage.local.get(['queue']);
+    const queue = data.queue || [];
+    for (const item of queue) {
+      if (item._pipelineRecordId && globalThis.bulkygenPipeline) {
+        globalThis.bulkygenPipeline.deliverGenerationResult(item.id, { success: false, error: reason });
+      }
+    }
+  } catch (e) { /* ignore */ }
+}
+
 async function startGeneration(resumeTabId) {
   if (loopActive) return; // a loop is already running in this worker
   loopActive = true;
@@ -303,9 +349,10 @@ async function startGeneration(resumeTabId) {
           console.log(`BulkyGen: Using background tab ${tabId} (${supportedTab.url.slice(0, 60)}...)`);
         } else {
           // 3. No supported page open anywhere — report error and exit
-          notifyPopup('generationError', {
-            message: 'No supported generator page found. Please open one of:\n- Flow: https://labs.google/fx/tools/flow/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image'
-          });
+          const msg = 'No supported generator page found. Please open one of:\n- Flow: https://labs.google/fx/tools/flow/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
+          console.warn('BulkyGen: startGeneration aborted — no supported tab found');
+          notifyPopup('generationError', { message: msg });
+          await _reportPipelineStartFailure('No supported generator page found');
           isRunning = false;
           loopActive = false;
           await ext.storage.local.set({ isRunning: false });
@@ -325,20 +372,39 @@ async function startGeneration(resumeTabId) {
     await ensureTabContentScript(currentTabId);
 
     // Verify we're on a supported page (works without `tabs` permission)
-    try {
-      const res = await ext.tabs.sendMessage(currentTabId, { action: 'checkPage' });
-      if (!res || !res.isSupportedPage) {
-        throw new Error('Unsupported page');
+    // Retry a few times: right after ensureTabContentScript() resolves, the
+    // content script may not have finished registering its message listener
+    // yet (a common MV3 race — "Receiving end does not exist"). A single
+    // attempt here was silently treated as "unsupported page" even when a
+    // supported page was open the whole time.
+    let checkRes = null;
+    let checkErr = null;
+    for (let i = 0; i < 4; i++) {
+      try {
+        const res = await ext.tabs.sendMessage(currentTabId, { action: 'checkPage' });
+        if (res && res.isSupportedPage) {
+          checkRes = res;
+          break;
+        }
+        checkErr = new Error('Unsupported page');
+      } catch (e) {
+        checkErr = e;
       }
-      currentProvider = res.provider || 'unknown';
-    } catch {
+      await sleep(500);
+    }
+
+    if (!checkRes) {
+      console.warn(`BulkyGen: startGeneration aborted — checkPage never succeeded (${checkErr?.message || 'unknown reason'})`);
       notifyPopup('generationError', {
         message: 'Please navigate to a supported page:\n- Flow: https://labs.google/fx/tools/flow/project\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image\n- Meta AI: https://www.meta.ai/media\n- Grok: https://x.com/i/grok'
       });
+      await _reportPipelineStartFailure(`checkPage failed: ${checkErr?.message || 'unsupported page'}`);
       isRunning = false;
+      loopActive = false;
       await ext.storage.local.set({ isRunning: false });
       return;
     }
+    currentProvider = checkRes.provider || 'unknown';
 
     const data = await ext.storage.local.get(['queue', 'delay']);
     const queue = data.queue || [];
@@ -1432,8 +1498,8 @@ function sanitizeFilename(name) {
 
       // Auto-start pipeline if autonomousMode is enabled
       if (settings && settings.autonomousMode) {
-        console.log('BulkyGen: Auto-starting autonomous pipeline on boot');
-        if (globalThis.bulkygenPipeline) {
+        if (globalThis.bulkygenPipeline && !globalThis.bulkygenPipeline.isRunning) {
+          console.log('BulkyGen: Auto-starting autonomous pipeline on boot');
           globalThis.bulkygenPipeline.start();
         }
       }

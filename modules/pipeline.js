@@ -98,6 +98,10 @@
         log()?.info(TAG, `Processing record ${id}`, { prompt: prompt.slice(0, 60) });
         const startMs = Date.now();
 
+        if (_stopFlag) {
+            throw new Error('Pipeline stopped by user');
+        }
+
         // ── Stage 1: Mark processing in Supabase ──────────────────────────────
         await supa()?.markProcessing(settings, id);
         await stats()?.setStatus('generating', prompt);
@@ -125,8 +129,19 @@
             isPaused: false
         });
 
-        // Signal the existing startGeneration handler
-        await ext.runtime.sendMessage({ action: 'startGeneration' }).catch(() => { });
+        // Signal the existing startGeneration handler and actually check whether
+        // it took — previously this was fire-and-forget, so a dropped signal
+        // (e.g. a stale legacy loop still marked active in this worker) meant
+        // waiting the full 300s timeout with zero information about why.
+        let startAck;
+        try {
+            startAck = await ext.runtime.sendMessage({ action: 'startGeneration' });
+        } catch (e) {
+            startAck = null; // no listener / extension context issue
+        }
+        if (startAck && startAck.started === false) {
+            throw new Error(`startGeneration was rejected by background (${startAck.reason || 'unknown reason'}) — a previous generation loop is likely still active`);
+        }
 
         // ── Stage 3: Wait for image result ─────────────────────────────────────
         log()?.info(TAG, `Waiting for generation result for item ${itemId}...`);
@@ -315,7 +330,19 @@
         let currentAttempts = record.attempts || 0;
         const deviceStr = settings.deviceName || (globalThis.navigator && globalThis.navigator.userAgent) || 'Unknown Device';
 
+        let wasStopped = false;
+
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (_stopFlag) {
+                // Without this check, stop() only cancelled the CURRENT wait —
+                // the for-loop kept going and immediately called processRecord()
+                // again with zero delay, which submitted a brand new prompt to
+                // Flow on every single remaining retry attempt. That's why stop
+                // never actually stopped anything until all retries burned through.
+                wasStopped = true;
+                lastError = lastError || new Error('Pipeline stopped by user');
+                break;
+            }
             try {
                 // We pass currentAttempts down so processRecord can update it on success if needed, 
                 // but actually processRecord leaves attempts alone on success.
@@ -327,7 +354,12 @@
                 currentAttempts++;
                 log()?.warn(TAG, `Record ${record.id} attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}`);
 
-                if (attempt < maxRetries && !_stopFlag) {
+                if (_stopFlag) {
+                    wasStopped = true;
+                    break;
+                }
+
+                if (attempt < maxRetries) {
                     // Update Supabase to show it's retrying
                     try {
                         const currentSettings = await cfg()?.get() || settings;
@@ -347,6 +379,27 @@
                     await _sleep(delay);
                 }
             }
+        }
+
+        if (wasStopped) {
+            // A user-requested stop is not a real failure — put the record back
+            // to 'pending' so it's picked up immediately on the next start()
+            // instead of sitting at 'failed' or waiting for the 10-minute
+            // stuck-record reclaim sweep.
+            log()?.info(TAG, `Record ${record.id} processing halted by stop request; returning to pending`);
+            try {
+                const currentSettings = await cfg()?.get() || settings;
+                await supa()?.updateRecord(currentSettings, record.id, {
+                    status: 'pending',
+                    attempts: currentAttempts,
+                    error_message: null,
+                    updated_at: new Date().toISOString(),
+                    worker_id: deviceStr
+                });
+            } catch (e) {
+                log()?.warn(TAG, `Could not reset record ${record.id} to pending after stop: ${e.message}`);
+            }
+            return;
         }
 
         // All retries exhausted
@@ -438,6 +491,14 @@
         if (!_stopFlag) {
             const pollMs = settings?.pollIntervalMs || 5000;
             _pollTimer = setTimeout(_poll, 100); // quick poll after success; idle waits pollMs above
+        } else {
+            // stop() was called while a record was in-flight — since we're not
+            // rescheduling, this is the last chance to clear _running. Without
+            // this, _running stays stuck true forever and every future start()
+            // call just logs "already running" and does nothing.
+            _running = false;
+            await stats()?.setStatus('idle');
+            log()?.info(TAG, 'Autonomous loop stopped');
         }
     }
 
@@ -457,16 +518,38 @@
             _running = true;
             _forceRun = force;
             log()?.info(TAG, `Autonomous pipeline starting (force=${force})`);
+
+            // Reclaim any records left stuck at status='processing' by a worker
+            // that got killed mid-run in a previous session — otherwise they're
+            // invisible to fetchPendingRecord() forever.
+            try {
+                const settings = await cfg()?.get();
+                if (settings) {
+                    const reclaimed = await supa()?.reclaimStuckRecords(settings, 10);
+                    if (reclaimed) log()?.info(TAG, `Reclaimed ${reclaimed} stuck 'processing' record(s)`);
+                }
+            } catch (e) {
+                log()?.warn(TAG, `Reclaim sweep failed (non-fatal): ${e.message}`);
+            }
+
             _poll();
         },
 
         /**
          * Gracefully stop the loop after the current record finishes.
+         * Also immediately cancels any in-flight wait for a generation result,
+         * since previously "stop" only affected the poll loop between records
+         * and did nothing while a record was actively waiting (up to 300s).
          */
         stop() {
             _stopFlag = true;
             _forceRun = false;
             if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+            for (const [itemId, waiter] of _pendingResults) {
+                clearTimeout(waiter.timer);
+                waiter.reject(new Error('Pipeline stopped by user'));
+            }
+            _pendingResults.clear();
             log()?.info(TAG, 'Autonomous pipeline stop requested');
         },
 

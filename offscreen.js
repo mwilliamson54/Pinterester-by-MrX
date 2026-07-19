@@ -80,8 +80,8 @@
         return {
             success: true,
             dataUrl: outputDataUrl,
-            width,
-            height,
+            width: finalCanvas.width,
+            height: finalCanvas.height,
             mimeType: 'image/jpeg',
             size: outputBlob.size
         };

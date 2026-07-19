@@ -80,6 +80,47 @@
     }
 
     /**
+     * Reclaim records stuck at status='processing' for longer than staleMinutes.
+     * This happens when the MV3 service worker is killed mid-generation — the
+     * record was claimed (status=processing) but the code that would eventually
+     * mark it completed/failed never got to run again, since fetchPendingRecord()
+     * only ever looks at status='pending'. Without this sweep those rows are
+     * silently lost forever. Call once when the pipeline starts (and optionally
+     * on a slow interval, e.g. every 10 minutes, while it runs).
+     *
+     * @param {Object} cfg
+     * @param {number} [staleMinutes=10]
+     * @returns {Promise<number>} number of records reclaimed
+     */
+    async function reclaimStuckRecords(cfg, staleMinutes = 10) {
+        const { supabaseUrl, supabaseAnonKey, supabaseTable } = cfg;
+        if (!supabaseUrl || !supabaseAnonKey || !supabaseTable) return 0;
+
+        const baseUrl = supabaseUrl.replace(/\/$/, '');
+        const cutoff = new Date(Date.now() - staleMinutes * 60000).toISOString();
+        const url = `${baseUrl}/rest/v1/${encodeURIComponent(supabaseTable)}` +
+            `?status=eq.processing&updated_at=lt.${encodeURIComponent(cutoff)}`;
+
+        const response = await fetch(url, {
+            method: 'PATCH',
+            headers: { ..._headers(supabaseAnonKey), 'Prefer': 'return=representation' },
+            body: JSON.stringify({
+                status: 'pending',
+                error_message: 'Reclaimed: stuck in processing (worker likely restarted mid-run)',
+                updated_at: new Date().toISOString()
+            })
+        });
+
+        if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`Reclaim stuck records failed (${response.status}): ${body}`);
+        }
+
+        const rows = await response.json().catch(() => []);
+        return Array.isArray(rows) ? rows.length : 0;
+    }
+
+    /**
      * Mark a record as 'failed' with an error message.
      *
      * @param {Object} cfg
@@ -235,6 +276,7 @@
         markProcessing,
         updateRecord,
         markFailed,
+        reclaimStuckRecords,
         testConnection,
         normalizeRecord
     };
