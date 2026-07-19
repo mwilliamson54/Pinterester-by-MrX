@@ -35,6 +35,17 @@ function detectProvider() {
 const PROVIDER = detectProvider();
 console.log(`BulkyGen: Content script loaded (provider=${PROVIDER})`);
 
+// Push a diagnostic to the background service worker so it lands in the same
+// exportable log the settings page shows — this content script's own
+// console.log() calls only ever appear in THIS tab's DevTools console, never
+// in the service worker inspector or the exported log, which is why Flow
+// failures (composer/button not found, etc.) used to look like total silence.
+function clientLog(level, tag, message) {
+  try {
+    (globalThis.chrome || ext).runtime.sendMessage({ action: 'clientLog', level, tag, message });
+  } catch (e) { /* ignore */ }
+}
+
 // --- In-page right sidebar (cross-browser) ---
 
 const BULKYGEN_PANEL_ID = 'bulkygen-right-panel';
@@ -1455,9 +1466,33 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'flowSubmitPrompt') {
+    clientLog('info', 'Flow', `Received flowSubmitPrompt message (itemId=${message.itemId}).`);
+    const __flowItemId = message.itemId;
+    const __pushFlowResult = (result) => {
+      // Same reliable delivery path used for generateImage: push the result
+      // independently of the sendMessage response channel. Flow generations
+      // (waitForFlowResults can run up to 120s, plus injection/click time) can
+      // easily outlive that channel in MV3 — without this push, a result that
+      // arrives after the channel closed was silently lost, so the background
+      // loop assumed failure and resubmitted the SAME prompt into Flow again,
+      // which is why generation appeared to loop forever and always hit the
+      // 300s pipeline timeout.
+      try {
+        (globalThis.chrome || ext).runtime.sendMessage({
+          action: 'generationResult', itemId: __flowItemId, result
+        });
+      } catch (e) { /* ignore */ }
+    };
     submitFlowPrompt(message.prompt, message.itemId)
-      .then(result => sendResponse(result))
-      .catch(error => sendResponse({ success: false, error: error.message }));
+      .then(result => {
+        __pushFlowResult(result);
+        try { sendResponse(result); } catch (e) { /* channel may be closed */ }
+      })
+      .catch(error => {
+        const result = { success: false, error: error.message };
+        __pushFlowResult(result);
+        try { sendResponse(result); } catch (e) { /* ignore */ }
+      });
     return true;
   }
 
@@ -2011,6 +2046,7 @@ async function generateImage(prompt, itemId) {
 
 async function submitFlowPrompt(prompt, itemId) {
   if (PROVIDER !== 'flow') {
+    clientLog('error', 'Flow', `submitFlowPrompt called but detected provider is "${PROVIDER}", not "flow" — the page BulkyGen is running on doesn't match a Flow project URL.`);
     throw new Error('Flow submit requested on non-Flow page');
   }
 
@@ -2018,14 +2054,17 @@ async function submitFlowPrompt(prompt, itemId) {
 
   try {
     console.log('BulkyGen Flow: submitFlowPrompt called, prompt:', prompt.substring(0, 40) + '...');
+    clientLog('info', 'Flow', `submitFlowPrompt called for "${prompt.substring(0, 60)}..."`);
 
     const uiReady = await waitForProviderUI();
     if (!uiReady) {
+      clientLog('warn', 'Flow', 'waitForProviderUI() reported not ready (no prompt textarea detected on the page).');
       throw new Error('Flow UI not ready. Make sure the prompt field is visible on the page.');
     }
 
     const editor = findFlowComposer();
     if (!editor) {
+      clientLog('error', 'Flow', 'Could not find the Flow prompt box (findFlowComposer() found no visible contenteditable/textarea) — nothing was typed. Flow\'s composer markup may have changed.');
       throw new Error('Could not find the Flow prompt box');
     }
     console.log('BulkyGen Flow: Found composer', editor.tagName, editor.className);
@@ -2042,13 +2081,20 @@ async function submitFlowPrompt(prompt, itemId) {
     const injected = await injectFlowPrompt(editor, prompt);
     console.log('BulkyGen Flow: injected (registered=' + injected.registered + '):', (injected.text || '').substring(0, 60));
     if (!injected.text) {
+      clientLog('error', 'Flow', 'Failed to inject the prompt into the Flow composer — paste/beforeinput dispatch did not put any text in the editor.');
       throw new Error('Failed to inject the prompt into the Flow composer');
+    }
+    if (!injected.registered) {
+      clientLog('warn', 'Flow', 'Prompt text was inserted but the generate button never registered as ready (findFlowSubmitButton heuristics may not match the current page markup).');
     }
     await waitUnthrottled(250);
 
     // --- Click the generate (arrow) button once it is enabled ---
     const submitted = await clickFlowGenerate(editor, prompt);
     console.log('BulkyGen Flow: submitted =', submitted);
+    if (!submitted) {
+      clientLog('warn', 'Flow', 'clickFlowGenerate() did not confirm the generate button was clicked.');
+    }
 
     // --- Wait for ALL generated images and capture them (x2 / x4 -> multiple) ---
     const images = [];

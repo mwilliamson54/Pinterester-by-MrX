@@ -24,6 +24,27 @@ let isPaused = false;
 let currentTabId = null;
 let loopActive = false; // true while a generation loop runs in THIS worker instance
 
+// Route a message into the exportable extension log (bulkygenLogger) AND the
+// service worker console. Content scripts (content.js) run in the page's own
+// JS context, so their console.log() output only ever shows up in that TAB's
+// DevTools console — never in the service worker inspector, and never in the
+// log the settings page exports. That gap is why Flow failures (e.g. "could
+// not find the prompt box") were invisible: the extension just looked like it
+// silently did nothing for 300s. Content scripts now report through the
+// 'clientLog' message action below, which funnels into this same helper.
+function logToExtension(level, tag, message) {
+  try {
+    const logger = globalThis.bulkygenLogger;
+    if (logger && typeof logger[level] === 'function') {
+      logger[level](tag, message);
+      return;
+    }
+  } catch (e) { /* fall through to console */ }
+  const fn = level === 'error' ? console.error : (level === 'warn' ? console.warn : console.log);
+  fn(`[BulkyGen][${tag}] ${message}`);
+}
+
+
 // ---------------------------------------------------------------------------
 // Background resilience: keep the MV3 service worker alive during a run and
 // resurrect the loop if the worker is ever killed (e.g. when the user switches
@@ -124,6 +145,11 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (currentTabId != null) {
       try { ext.tabs.sendMessage(currentTabId, { action: 'bgKeepAlive', on: false }).catch(() => { }); } catch (e) { }
     }
+  } else if (message.action === 'clientLog') {
+    // Diagnostics pushed from content.js (the Flow/provider tab) — see
+    // logToExtension() above for why this bridge exists.
+    logToExtension(message.level || 'info', message.tag || 'ContentScript', message.message || '');
+    return false;
   } else if (message.action === 'generationResult') {
     // Content script pushed a finished generation result (reliable delivery
     // path for long generations whose response channel may have closed).
@@ -405,6 +431,7 @@ async function startGeneration(resumeTabId) {
       return;
     }
     currentProvider = checkRes.provider || 'unknown';
+    logToExtension('info', 'Background', `Using provider="${currentProvider}" on tab ${currentTabId} for this run.`);
 
     const data = await ext.storage.local.get(['queue', 'delay']);
     const queue = data.queue || [];
@@ -637,8 +664,18 @@ async function runFlowSequentialGeneration(queue, delay) {
   // NEVER FAIL: keep retrying the same prompt until it actually produces an
   // image. Retries fire IMMEDIATELY (no backoff). The only things that end the
   // loop are a successful capture or the user pressing Stop (isRunning = false).
-  const MAX_RETRIES = Infinity;   // never give up on a prompt
-  const RETRY_BACKOFF_MS = 0;     // retry instantly
+  // Bounded retries with a short gap between attempts. This used to be
+  // Infinity/0ms — an unconditional, zero-delay retry loop. If Flow's page
+  // (composer or generate button) simply couldn't be located, that spun
+  // silently forever: every attempt failed instantly and re-tried instantly,
+  // so nothing was ever typed, no diagnostic ever reached the visible logs
+  // (content-script console.log only appears in the Flow tab's own DevTools,
+  // not the service worker inspector), and the record just sat there until
+  // the pipeline's separate 300s timeout eventually gave up on its own. Now a
+  // real failure reason surfaces (via logToExtension) after a handful of
+  // quick attempts instead of hanging silently for the full 5 minutes.
+  const MAX_RETRIES = 8;
+  const RETRY_BACKOFF_MS = 1500;
   const FLOW_GAP_MS = 0;          // no spacing between successful prompts
 
   for (let i = 0; i < queue.length && isRunning; i++) {
@@ -661,6 +698,16 @@ async function runFlowSequentialGeneration(queue, delay) {
       try {
         await ensureTabContentScript(currentTabId);
 
+        // Register a fallback waiter FIRST: Flow generations (composer inject +
+        // click + up to 120s waiting for the result image) can easily outlive
+        // the sendMessage response channel in MV3. Previously, any channel error
+        // here caused an immediate re-inject-and-resend of the SAME prompt, even
+        // though Flow could still be generating the original one server-side —
+        // that duplicate resubmission (plus the lost original result) is what
+        // made this loop spin and always burn through the full 300s pipeline
+        // timeout. Now we wait for the content script's pushed result instead
+        // of resubmitting whenever the error looks like a closed channel.
+        const __flowWaiter = registerResultWaiter(queue[i].id, 300000);
         let result;
         try {
           result = await ext.tabs.sendMessage(currentTabId, {
@@ -668,15 +715,42 @@ async function runFlowSequentialGeneration(queue, delay) {
             prompt: queue[i].prompt,
             itemId: queue[i].id
           });
+          __flowWaiter.cancel();
         } catch (sendErr) {
-          // Content script unreachable -> force re-inject and retry once.
-          await ensureTabContentScript(currentTabId, true);
-          await sleep(400);
-          result = await ext.tabs.sendMessage(currentTabId, {
-            action: 'flowSubmitPrompt',
-            prompt: queue[i].prompt,
-            itemId: queue[i].id
-          });
+          const smsg = (sendErr && sendErr.message) || String(sendErr);
+          if (/message channel closed|asynchronous response|message port closed/i.test(smsg)) {
+            console.log(`⏳ flow: response channel closed for prompt ${i + 1}; awaiting pushed result (no regeneration)...`);
+            result = await __flowWaiter.promise;
+            if (!result) {
+              throw new Error('Generation result not received after the response channel closed');
+            }
+          } else {
+            __flowWaiter.cancel();
+            // Content script unreachable -> force re-inject and retry once.
+            await ensureTabContentScript(currentTabId, true);
+            await sleep(400);
+            const __flowWaiter2 = registerResultWaiter(queue[i].id, 300000);
+            try {
+              result = await ext.tabs.sendMessage(currentTabId, {
+                action: 'flowSubmitPrompt',
+                prompt: queue[i].prompt,
+                itemId: queue[i].id
+              });
+              __flowWaiter2.cancel();
+            } catch (sendErr2) {
+              const smsg2 = (sendErr2 && sendErr2.message) || String(sendErr2);
+              if (/message channel closed|asynchronous response|message port closed/i.test(smsg2)) {
+                console.log(`⏳ flow: response channel closed for prompt ${i + 1} (retry); awaiting pushed result (no regeneration)...`);
+                result = await __flowWaiter2.promise;
+                if (!result) {
+                  throw new Error('Generation result not received after the response channel closed');
+                }
+              } else {
+                __flowWaiter2.cancel();
+                throw sendErr2;
+              }
+            }
+          }
         }
 
         // Collect captured images (Flow x2 / x4 produce multiple per prompt).
@@ -733,11 +807,22 @@ async function runFlowSequentialGeneration(queue, delay) {
         attempt++;
         if (attempt > MAX_RETRIES) {
           queue[i].status = 'error';
+          logToExtension('warn', 'Flow', `Prompt ${i + 1} failed after ${MAX_RETRIES + 1} tries: ${err.message}`);
           notifyPopup('generationError', {
             message: `Flow prompt ${i + 1} failed after ${MAX_RETRIES + 1} tries: ${err.message}`
           });
+          // Report failure to the pipeline right away instead of leaving it to
+          // burn out its own separate 300s wait with no information.
+          if (queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
+            try {
+              globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
+                success: false,
+                error: err.message
+              });
+            } catch (e) { /* ignore */ }
+          }
         } else {
-          console.log(`\u{1F501} Flow: prompt ${i + 1} failed (${err.message}); auto-retrying in place immediately (attempt ${attempt})...`);
+          logToExtension('warn', 'Flow', `Prompt ${i + 1} failed (${err.message}); auto-retrying (attempt ${attempt}/${MAX_RETRIES})...`);
           // Keep the slot marked as processing while we retry it in place.
           queue[i].status = 'processing';
           await ext.storage.local.set({ queue });
