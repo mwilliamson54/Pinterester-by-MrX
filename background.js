@@ -23,6 +23,29 @@ let isRunning = false;
 let isPaused = false;
 let currentTabId = null;
 let loopActive = false; // true while a generation loop runs in THIS worker instance
+let loopActiveSince = null; // timestamp loopActive last flipped true — lets us detect a stuck/orphaned loop
+
+// When startGeneration() bails out early (no supported tab, checkPage never
+// succeeded, etc.) it previously just returned — leaving the pipeline's
+// _awaitGenerationResult() with no idea anything went wrong. It would sit
+// waiting the full 300s for a result that was never coming, and the REAL
+// reason (visible only via console.warn in the service worker's own
+// inspector) never reached the log the user actually looks at. This reads
+// whatever's currently queued and fails it immediately with the real reason,
+// so the pipeline retries right away instead of burning a silent 5 minutes.
+async function _failQueuedItems(reason) {
+  try {
+    const data = await ext.storage.local.get(['queue']);
+    const queue = data.queue || [];
+    for (const item of queue) {
+      if (item && item.id && item.status !== 'completed') {
+        try {
+          globalThis.bulkygenPipeline?.deliverGenerationResult(item.id, { success: false, error: reason });
+        } catch (e) { /* ignore */ }
+      }
+    }
+  } catch (e) { /* non-fatal */ }
+}
 
 // Route a message into the exportable extension log (bulkygenLogger) AND the
 // service worker console. Content scripts (content.js) run in the page's own
@@ -128,10 +151,23 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startGeneration') {
-    if (loopActive) {
-      console.warn('BulkyGen: startGeneration ignored — a generation loop is already active in this worker (loopActive=true). This is why a pipeline record can hang until its 300s timeout with no logs at all.');
+    // A loop that's been "active" for longer than the pipeline's own 300s
+    // per-record timeout is not legitimately busy — it's orphaned (its
+    // internal wait hung with no timeout of its own, e.g. a Flow DOM
+    // interaction that never resolved). Without this check, loopActive stays
+    // stuck true for the rest of the worker's lifetime and every future
+    // record silently times out after 300s with zero logs, since this branch
+    // was rejecting them without ever calling the real startGeneration().
+    const STALE_MS = 6 * 60 * 1000; // safely longer than the 300s pipeline timeout
+    const isStale = loopActive && loopActiveSince && (Date.now() - loopActiveSince > STALE_MS);
+    if (loopActive && !isStale) {
+      logToExtension('warn', 'Background', 'startGeneration rejected — a generation loop is already active in this worker (loopActive=true).');
       sendResponse({ started: false, reason: 'loopActive' });
       return false;
+    }
+    if (isStale) {
+      logToExtension('warn', 'Background', `startGeneration: loopActive was stuck true for ${Math.round((Date.now() - loopActiveSince) / 1000)}s with no activity — treating as orphaned and recovering.`);
+      loopActive = false; loopActiveSince = null;
     }
     startGeneration().catch((e) => console.error('startGeneration error:', e));
     sendResponse({ started: true });
@@ -234,6 +270,12 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: error.message });
     });
     return true;
+  } else if (message.action === 'checkGenerationAlive') {
+    // Pipeline heartbeat probe: lets _awaitGenerationResult() know whether the
+    // generation loop is still active. If alive=false, the pipeline fails fast
+    // (2-second retry) instead of waiting the full 300-second timeout.
+    sendResponse({ alive: loopActive });
+    return false;
   } else if (message.action === 'exportLogs') {
     // Return the serialised log buffer to any settings/popup page that asks
     try {
@@ -353,6 +395,7 @@ async function _reportPipelineStartFailure(reason) {
 async function startGeneration(resumeTabId) {
   if (loopActive) return; // a loop is already running in this worker
   loopActive = true;
+  loopActiveSince = Date.now();
   isRunning = true;
   if (resumeTabId == null) { isPaused = false; __runCapturedHashes.clear(); }
   await ext.storage.local.set({ isRunning: true, isPaused });
@@ -376,11 +419,12 @@ async function startGeneration(resumeTabId) {
         } else {
           // 3. No supported page open anywhere — report error and exit
           const msg = 'No supported generator page found. Please open one of:\n- Flow: https://labs.google/fx/tools/flow/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
-          console.warn('BulkyGen: startGeneration aborted — no supported tab found');
+          logToExtension('warn', 'Background', 'startGeneration aborted — no supported tab found. ' + msg.split('\n')[0]);
           notifyPopup('generationError', { message: msg });
           await _reportPipelineStartFailure('No supported generator page found');
+          await _failQueuedItems('No supported generator page found');
           isRunning = false;
-          loopActive = false;
+          loopActive = false; loopActiveSince = null;
           await ext.storage.local.set({ isRunning: false });
           return;
         }
@@ -420,13 +464,15 @@ async function startGeneration(resumeTabId) {
     }
 
     if (!checkRes) {
-      console.warn(`BulkyGen: startGeneration aborted — checkPage never succeeded (${checkErr?.message || 'unknown reason'})`);
+      const reason = `checkPage failed: ${checkErr?.message || 'unsupported page'}`;
+      logToExtension('warn', 'Background', `startGeneration aborted — checkPage never succeeded on tab ${currentTabId} (${checkErr?.message || 'unknown reason'}).`);
       notifyPopup('generationError', {
         message: 'Please navigate to a supported page:\n- Flow: https://labs.google/fx/tools/flow/project\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image\n- Meta AI: https://www.meta.ai/media\n- Grok: https://x.com/i/grok'
       });
-      await _reportPipelineStartFailure(`checkPage failed: ${checkErr?.message || 'unsupported page'}`);
+      await _reportPipelineStartFailure(reason);
+      await _failQueuedItems(reason);
       isRunning = false;
-      loopActive = false;
+      loopActive = false; loopActiveSince = null;
       await ext.storage.local.set({ isRunning: false });
       return;
     }
@@ -641,7 +687,13 @@ async function startGeneration(resumeTabId) {
       });
     }
   } finally {
-    loopActive = false;
+    loopActive = false; loopActiveSince = null;
+    // Notify any pipeline waiters that the loop is gone so they fail fast
+    // instead of burning their full 300-second timeout with zero activity.
+    // This is the single most important escape hatch: if startGeneration exits
+    // for ANY reason (tab gone, checkPage failed, fatalDisconnect, normal finish)
+    // the pipeline learns about it within milliseconds instead of 300 seconds.
+    try { globalThis.bulkygenPipeline?.onGenerationLoopDied?.(); } catch (e) { /* ignore */ }
     if (!isRunning) {
       stopSwKeepAlive();
       disarmKeepAliveAlarm();
@@ -839,6 +891,16 @@ async function runFlowSequentialGeneration(queue, delay) {
       notifyPopup('generationError', {
         message: 'Content script not loaded. Please refresh the Flow project page and try again.'
       });
+      // Deliver failure to any pipeline waiter for the current item so it retries
+      // immediately instead of hanging for the full 300-second timeout.
+      if (queue[i] && queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
+        try {
+          globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
+            success: false,
+            error: 'Content script fatal disconnect — page needs refresh'
+          });
+        } catch (e) { /* ignore */ }
+      }
       isRunning = false;
       break;
     }

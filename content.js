@@ -2018,6 +2018,12 @@ let __kaStop = null;
 let __bgPersistKeepAlive = false;
 let __kaRefs = 0;
 let __kaLingerTimer = null;
+// The itemId of whatever generation is currently in flight in this content
+// script context. Set to null when idle. Used by the unload handler below to
+// send a failure signal to the background when this context is torn down while
+// a generation is still running (e.g. Flow SPA navigates away mid-generation),
+// so the pipeline fails fast instead of waiting 300 seconds.
+let __activeGenerationItemId = null;
 function ensureKeepAlive() {
   __kaRefs++;
   if (__kaLingerTimer) { clearTimeout(__kaLingerTimer); __kaLingerTimer = null; }
@@ -2036,10 +2042,11 @@ function releaseKeepAlive() {
 async function generateImage(prompt, itemId) {
   // Start background keep-alive to prevent tab throttle
   ensureKeepAlive();
-
+  __activeGenerationItemId = itemId || null;
   try {
     return await generateImageInternal(prompt, itemId);
   } finally {
+    __activeGenerationItemId = null;
     releaseKeepAlive();
   }
 }
@@ -2051,6 +2058,7 @@ async function submitFlowPrompt(prompt, itemId) {
   }
 
   ensureKeepAlive();
+  __activeGenerationItemId = itemId || null;
 
   try {
     console.log('BulkyGen Flow: submitFlowPrompt called, prompt:', prompt.substring(0, 40) + '...');
@@ -2146,6 +2154,7 @@ async function submitFlowPrompt(prompt, itemId) {
       meta: { ...meta, captured: images.length, submitted: submitted, registered: injected.registered }
     };
   } finally {
+    __activeGenerationItemId = null;
     releaseKeepAlive();
   }
 }
@@ -4185,3 +4194,31 @@ function sanitizeFilename(name) {
     .replace(/^-|-$/g, '')
     .substring(0, 50);
 }
+
+// ── Unload guard ─────────────────────────────────────────────────────────────
+// When the Flow SPA navigates to another route (or the tab is closed) while a
+// generation is in-flight, Chrome tears down this content-script context
+// immediately. The background's __resultWaiters and pipeline's _pendingResults
+// would then silently wait out their full 300-second timeout with zero activity
+// unless we notify them here. We fire a best-effort `generationResult` failure
+// message so both fail fast and the pipeline retries in ~2 seconds instead of
+// 5 minutes.
+//
+// `pagehide` fires even for bfcache (back-forward cache) navigations in Chrome,
+// whereas `beforeunload` only fires on a real unload. We listen to both for
+// maximum coverage, but gate on __activeGenerationItemId so we only signal when
+// there is actually something in flight.
+function __onPageUnload() {
+  const itemId = __activeGenerationItemId;
+  if (!itemId) return; // nothing in flight — nothing to do
+  clientLog('warn', 'ContentScript', `Page unloading mid-generation (itemId=${itemId}) — sending failure signal so pipeline retries immediately.`);
+  try {
+    (globalThis.chrome || ext).runtime.sendMessage({
+      action: 'generationResult',
+      itemId,
+      result: { success: false, error: 'Content script context was destroyed mid-generation (page navigation or reload)' }
+    });
+  } catch (e) { /* context already gone — background will detect via heartbeat */ }
+}
+window.addEventListener('pagehide', __onPageUnload, { capture: true });
+window.addEventListener('beforeunload', __onPageUnload, { capture: true });

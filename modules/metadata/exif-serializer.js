@@ -47,9 +47,18 @@
                 const ifd = parts[0];
                 const tagStr = parts[1];
                 
-                // Get numeric tag ID from piexif
-                const dictName = ifd === '0th' ? 'ImageIFD' : ifd;
-                const tagId = piexif.TagValues[dictName]?.[tagStr] || piexif[dictName]?.[tagStr];
+                // Get numeric tag ID from piexif. piexif exposes its tag
+                // dictionaries as ImageIFD / ExifIFD / GPSIFD / InteropIFD —
+                // not under the raw IFD section names used in mappedExif keys.
+                const dictNameMap = {
+                    '0th': 'ImageIFD',
+                    '1st': 'ImageIFD',
+                    'Exif': 'ExifIFD',
+                    'GPS': 'GPSIFD',
+                    'Interop': 'InteropIFD'
+                };
+                const dictName = dictNameMap[ifd] || ifd;
+                const tagId = piexif[dictName]?.[tagStr];
                 
                 if (tagId !== undefined) {
                     if (tagStr.startsWith('XP') && typeof value === 'string') {

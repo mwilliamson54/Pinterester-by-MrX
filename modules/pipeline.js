@@ -57,15 +57,47 @@
 
     /**
      * Wait for the existing generation loop to push a result for the given itemId.
-     * Times out after timeoutMs.
+     * Times out after timeoutMs, but also probes the background every HEARTBEAT_MS
+     * to see whether the generation loop is still alive. If it has exited, we fail
+     * immediately instead of burning the full timeout doing nothing.
      */
+    const HEARTBEAT_MS = 10000; // ping background every 10 seconds
     function _awaitGenerationResult(itemId, timeoutMs = 300000) {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
+            let settled = false;
+            const settle = (fn, arg) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(hardTimer);
+                clearInterval(heartbeat);
                 _pendingResults.delete(itemId);
-                reject(new Error(`Generation timeout after ${timeoutMs / 1000}s for itemId=${itemId}`));
+                fn(arg);
+            };
+
+            // Hard deadline — last-resort safety net
+            const hardTimer = setTimeout(() => {
+                settle(reject, new Error(`Generation timeout after ${timeoutMs / 1000}s for itemId=${itemId}`));
             }, timeoutMs);
-            _pendingResults.set(itemId, { resolve, reject, timer });
+
+            // Periodic liveness probe: ask background if the loop is still running.
+            // If it's not, there is nothing that will ever deliver a result to us,
+            // so we fail fast and let the pipeline retry instead of idling 300 s.
+            const heartbeat = setInterval(async () => {
+                if (settled) { clearInterval(heartbeat); return; }
+                try {
+                    const ext = globalThis.ext;
+                    if (!ext) return; // can't probe, keep waiting
+                    const res = await ext.runtime.sendMessage({ action: 'checkGenerationAlive' });
+                    if (res && res.alive === false) {
+                        settle(reject, new Error('Generation loop exited unexpectedly — no result will arrive for itemId=' + itemId));
+                    }
+                } catch (e) {
+                    // Message channel gone (worker restart) — also means loop is dead
+                    settle(reject, new Error('Background worker unreachable — generation loop likely restarted (itemId=' + itemId + ')'));
+                }
+            }, HEARTBEAT_MS);
+
+            _pendingResults.set(itemId, { resolve: (r) => settle(resolve, r), reject: (e) => settle(reject, e), timer: hardTimer });
         });
     }
 
@@ -550,6 +582,20 @@
                 waiter.reject(new Error('Pipeline stopped by user'));
             }
             _pendingResults.clear();
+
+            // Cancelling a pending result above only cancels the PIPELINE's own
+            // wait — it does nothing to the actual Flow generation loop running
+            // in background.js, which has no idea the pipeline gave up. That
+            // loop keeps `loopActive`/`isRunning` set to true in background.js,
+            // so the next record's startGeneration call gets silently rejected
+            // (reason: 'loopActive') or never acknowledged, and the record just
+            // sits waiting for the full 300s timeout with zero log activity.
+            // Explicitly stopping the background loop here keeps its state in
+            // sync with the pipeline so the next record can actually start.
+            try {
+                globalThis.ext?.runtime?.sendMessage({ action: 'stopGeneration' })?.catch(() => { });
+            } catch (e) { /* no listener / context gone — non-fatal */ }
+
             log()?.info(TAG, 'Autonomous pipeline stop requested');
         },
 
@@ -561,7 +607,25 @@
          * Called by background.js message handler when action='generationResult'
          * and the item originated from the pipeline.
          */
-        deliverGenerationResult
+        deliverGenerationResult,
+
+        /**
+         * Called by background.js when the generation loop exits for any reason
+         * (finally block). Immediately rejects ALL pending result waiters so they
+         * fail fast instead of sitting out their full 300-second timeout with zero
+         * activity. The pipeline's retry wrapper will then pick up and retry.
+         */
+        onGenerationLoopDied() {
+            if (_pendingResults.size === 0) return;
+            log()?.warn(TAG, `Generation loop died — force-failing ${_pendingResults.size} pending waiter(s)`);
+            for (const [itemId, waiter] of _pendingResults) {
+                try {
+                    clearTimeout(waiter.timer);
+                    waiter.reject(new Error('Generation loop exited unexpectedly — pipeline will retry'));
+                } catch (e) { /* ignore */ }
+            }
+            _pendingResults.clear();
+        }
     };
 
     globalThis.bulkygenPipeline = pipeline;
