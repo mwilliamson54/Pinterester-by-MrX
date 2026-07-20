@@ -24,6 +24,91 @@ let isPaused = false;
 let currentTabId = null;
 let loopActive = false; // true while a generation loop runs in THIS worker instance
 let loopActiveSince = null; // timestamp loopActive last flipped true — lets us detect a stuck/orphaned loop
+let loopPhase = 'idle'; // coarse progress marker for pipeline heartbeat / stall detection
+let loopProgressAt = 0; // Date.now() of last markLoopProgress()
+
+function markLoopProgress(phase) {
+  loopPhase = phase || loopPhase;
+  loopProgressAt = Date.now();
+}
+
+function getGenerationStatus() {
+  return {
+    alive: !!loopActive,
+    phase: loopPhase,
+    lastProgressAt: loopProgressAt || null,
+    loopActiveSince: loopActiveSince || null,
+    stalledMs: loopProgressAt ? (Date.now() - loopProgressAt) : null
+  };
+}
+
+/** Force-stop a hung generation loop so the next pipeline record can start. */
+function abortGenerationLoop(reason) {
+  const msg = reason || 'unspecified';
+  logToExtension('warn', 'Background', `Aborting generation loop (phase=${loopPhase}): ${msg}`);
+  isRunning = false;
+  isPaused = false;
+  loopActive = false;
+  loopActiveSince = null;
+  markLoopProgress('aborted');
+  try { ext.storage.local.set({ isRunning: false, isPaused: false }).catch(() => { }); } catch (e) { /* ignore */ }
+  if (currentTabId != null) {
+    try { ext.tabs.sendMessage(currentTabId, { action: 'bgKeepAlive', on: false }).catch(() => { }); } catch (e) { /* ignore */ }
+  }
+}
+
+/**
+ * Race a promise against a timeout. Used to bound chrome.scripting.executeScript
+ * and tabs.sendMessage calls that can hang indefinitely with zero logs.
+ */
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${label || 'operation'} timed out after ${Math.round(ms / 1000)}s`));
+      }, ms);
+    })
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+/**
+ * Shared entry point for starting generation (message handler + in-process pipeline).
+ * Avoids chrome.runtime.sendMessage self-calls from the service worker, which are
+ * unreliable and were a source of silent null acks / lost starts.
+ */
+function tryStartGeneration(resumeTabId) {
+  const STALE_MS = 6 * 60 * 1000;
+  const STALL_MS = 90 * 1000; // no progress marks for 90s ⇒ orphaned even if loopActive
+  const stalled = loopActive && loopProgressAt && (Date.now() - loopProgressAt > STALL_MS);
+  const isStale = loopActive && loopActiveSince && (Date.now() - loopActiveSince > STALE_MS);
+  if (loopActive && !isStale && !stalled) {
+    logToExtension('warn', 'Background', 'startGeneration rejected — a generation loop is already active in this worker (loopActive=true).');
+    return { started: false, reason: 'loopActive', status: getGenerationStatus() };
+  }
+  if (isStale || stalled) {
+    logToExtension('warn', 'Background',
+      `startGeneration: loopActive was stuck (phase=${loopPhase}, age=${Math.round((Date.now() - (loopActiveSince || Date.now())) / 1000)}s, stalledMs=${loopProgressAt ? Date.now() - loopProgressAt : 'n/a'}) — treating as orphaned and recovering.`);
+    isRunning = false;
+    loopActive = false;
+    loopActiveSince = null;
+    markLoopProgress('recovered');
+  }
+  startGeneration(resumeTabId).catch((e) => {
+    logToExtension('error', 'Background', `startGeneration error: ${e?.message || e}`);
+    console.error('startGeneration error:', e);
+  });
+  return { started: true, status: getGenerationStatus() };
+}
+
+// In-process API for modules/pipeline.js (same SW — no self-sendMessage needed).
+globalThis.bulkygenGeneration = {
+  tryStart: tryStartGeneration,
+  abort: abortGenerationLoop,
+  getStatus: getGenerationStatus,
+  markProgress: markLoopProgress
+};
 
 // When startGeneration() bails out early (no supported tab, checkPage never
 // succeeded, etc.) it previously just returned — leaving the pipeline's
@@ -115,7 +200,7 @@ if (typeof chrome !== 'undefined' && chrome.alarms && chrome.alarms.onAlarm) {
         startSwKeepAlive();
         isPaused = !!data.isPaused;
         console.log('\u23f0 Watchdog: resuming generation after worker wake');
-        startGeneration(typeof data.genTabId === 'number' ? data.genTabId : undefined);
+        tryStartGeneration(typeof data.genTabId === 'number' ? data.genTabId : undefined);
       } else if (!data.isRunning && !data.pipelineRunning) {
         disarmKeepAliveAlarm();
         stopSwKeepAlive();
@@ -151,36 +236,25 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startGeneration') {
-    // A loop that's been "active" for longer than the pipeline's own 300s
-    // per-record timeout is not legitimately busy — it's orphaned (its
-    // internal wait hung with no timeout of its own, e.g. a Flow DOM
-    // interaction that never resolved). Without this check, loopActive stays
-    // stuck true for the rest of the worker's lifetime and every future
-    // record silently times out after 300s with zero logs, since this branch
-    // was rejecting them without ever calling the real startGeneration().
-    const STALE_MS = 6 * 60 * 1000; // safely longer than the 300s pipeline timeout
-    const isStale = loopActive && loopActiveSince && (Date.now() - loopActiveSince > STALE_MS);
-    if (loopActive && !isStale) {
-      logToExtension('warn', 'Background', 'startGeneration rejected — a generation loop is already active in this worker (loopActive=true).');
-      sendResponse({ started: false, reason: 'loopActive' });
-      return false;
-    }
-    if (isStale) {
-      logToExtension('warn', 'Background', `startGeneration: loopActive was stuck true for ${Math.round((Date.now() - loopActiveSince) / 1000)}s with no activity — treating as orphaned and recovering.`);
-      loopActive = false; loopActiveSince = null;
-    }
-    startGeneration().catch((e) => console.error('startGeneration error:', e));
-    sendResponse({ started: true });
+    sendResponse(tryStartGeneration());
     return false;
   } else if (message.action === 'stopGeneration') {
     isRunning = false;
     isPaused = false;
-    ext.storage.local.set({ isPaused: false }).catch(() => { });
+    loopActive = false;
+    loopActiveSince = null;
+    markLoopProgress('stopped');
+    ext.storage.local.set({ isPaused: false, isRunning: false }).catch(() => { });
     stopSwKeepAlive();
     disarmKeepAliveAlarm();
     if (currentTabId != null) {
       try { ext.tabs.sendMessage(currentTabId, { action: 'bgKeepAlive', on: false }).catch(() => { }); } catch (e) { }
     }
+    return false;
+  } else if (message.action === 'abortGeneration') {
+    abortGenerationLoop(message.reason || 'abortGeneration message');
+    sendResponse({ aborted: true });
+    return false;
   } else if (message.action === 'clientLog') {
     // Diagnostics pushed from content.js (the Flow/provider tab) — see
     // logToExtension() above for why this bridge exists.
@@ -271,10 +345,9 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   } else if (message.action === 'checkGenerationAlive') {
-    // Pipeline heartbeat probe: lets _awaitGenerationResult() know whether the
-    // generation loop is still active. If alive=false, the pipeline fails fast
-    // (2-second retry) instead of waiting the full 300-second timeout.
-    sendResponse({ alive: loopActive });
+    // Includes phase/stall info so a hung loop (loopActive=true but no progress)
+    // fails fast instead of burning the full 300s pipeline timeout.
+    sendResponse(getGenerationStatus());
     return false;
   } else if (message.action === 'exportLogs') {
     // Return the serialised log buffer to any settings/popup page that asks
@@ -397,12 +470,15 @@ async function startGeneration(resumeTabId) {
   loopActive = true;
   loopActiveSince = Date.now();
   isRunning = true;
+  markLoopProgress('starting');
   if (resumeTabId == null) { isPaused = false; __runCapturedHashes.clear(); }
-  await ext.storage.local.set({ isRunning: true, isPaused });
-  startSwKeepAlive();
-  armKeepAliveAlarm();
   try {
+    await ext.storage.local.set({ isRunning: true, isPaused });
+    startSwKeepAlive();
+    armKeepAliveAlarm();
+
     let tabId = resumeTabId;
+    markLoopProgress('finding_tab');
 
     if (tabId == null) {
       // 1. Try the currently active tab first
@@ -433,25 +509,40 @@ async function startGeneration(resumeTabId) {
 
     currentTabId = tabId;
     await ext.storage.local.set({ genTabId: tabId });
+    logToExtension('info', 'Background', `startGeneration: using tab ${tabId}`);
     // Hold the page's silent-audio keep-alive for the entire run so it stays
     // unthrottled in the background between every prompt / fetch / retry.
     try { ext.tabs.sendMessage(tabId, { action: 'bgKeepAlive', on: true }).catch(() => { }); } catch (e) { }
     let currentProvider = 'unknown';
 
     // Make sure the content script is loaded (no manual page reload needed).
-    await ensureTabContentScript(currentTabId);
+    // Bounded: executeScript can hang indefinitely on awkward tab states.
+    markLoopProgress('ensure_cs');
+    logToExtension('info', 'Background', `Ensuring content script on tab ${currentTabId}...`);
+    const csOk = await ensureTabContentScript(currentTabId);
+    if (!csOk) {
+      logToExtension('warn', 'Background', `ensureTabContentScript did not confirm injection on tab ${currentTabId}; continuing to checkPage anyway.`);
+    } else {
+      markLoopProgress('ensure_cs_done');
+    }
 
     // Verify we're on a supported page (works without `tabs` permission)
     // Retry a few times: right after ensureTabContentScript() resolves, the
     // content script may not have finished registering its message listener
-    // yet (a common MV3 race — "Receiving end does not exist"). A single
-    // attempt here was silently treated as "unsupported page" even when a
-    // supported page was open the whole time.
+    // yet (a common MV3 race — "Receiving end does not exist"). Each attempt
+    // is also time-bounded so a hung tabs.sendMessage cannot burn 300s.
+    markLoopProgress('check_page');
     let checkRes = null;
     let checkErr = null;
     for (let i = 0; i < 4; i++) {
+      if (!isRunning) break;
       try {
-        const res = await ext.tabs.sendMessage(currentTabId, { action: 'checkPage' });
+        logToExtension('info', 'Background', `checkPage attempt ${i + 1}/4 on tab ${currentTabId}...`);
+        const res = await withTimeout(
+          ext.tabs.sendMessage(currentTabId, { action: 'checkPage' }),
+          5000,
+          `checkPage attempt ${i + 1}`
+        );
         if (res && res.isSupportedPage) {
           checkRes = res;
           break;
@@ -459,6 +550,7 @@ async function startGeneration(resumeTabId) {
         checkErr = new Error('Unsupported page');
       } catch (e) {
         checkErr = e;
+        logToExtension('warn', 'Background', `checkPage attempt ${i + 1}/4 failed: ${e?.message || e}`);
       }
       await sleep(500);
     }
@@ -477,6 +569,7 @@ async function startGeneration(resumeTabId) {
       return;
     }
     currentProvider = checkRes.provider || 'unknown';
+    markLoopProgress('generating');
     logToExtension('info', 'Background', `Using provider="${currentProvider}" on tab ${currentTabId} for this run.`);
 
     const data = await ext.storage.local.get(['queue', 'delay']);
@@ -688,6 +781,7 @@ async function startGeneration(resumeTabId) {
     }
   } finally {
     loopActive = false; loopActiveSince = null;
+    markLoopProgress('idle');
     // Notify any pipeline waiters that the loop is gone so they fail fast
     // instead of burning their full 300-second timeout with zero activity.
     // This is the single most important escape hatch: if startGeneration exits
@@ -759,36 +853,62 @@ async function runFlowSequentialGeneration(queue, delay) {
         // made this loop spin and always burn through the full 300s pipeline
         // timeout. Now we wait for the content script's pushed result instead
         // of resubmitting whenever the error looks like a closed channel.
-        const __flowWaiter = registerResultWaiter(queue[i].id, 300000);
+        const __flowWaiter = registerResultWaiter(queue[i].id, 180000);
         let result;
+        markLoopProgress('flow_submit');
+        logToExtension('info', 'Flow', `Sending flowSubmitPrompt for item ${queue[i].id} (prompt ${i + 1}/${queue.length})...`);
         try {
-          result = await ext.tabs.sendMessage(currentTabId, {
-            action: 'flowSubmitPrompt',
-            prompt: queue[i].prompt,
-            itemId: queue[i].id
-          });
+          // Race sendMessage against the pushed-result waiter so a hung response
+          // channel (or a content script that never sendResponse's) cannot block
+          // forever. Content also pushes generationResult independently.
+          result = await Promise.race([
+            ext.tabs.sendMessage(currentTabId, {
+              action: 'flowSubmitPrompt',
+              prompt: queue[i].prompt,
+              itemId: queue[i].id
+            }),
+            __flowWaiter.promise.then((r) => {
+              if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result');
+              return r;
+            })
+          ]);
           __flowWaiter.cancel();
+          markLoopProgress('flow_result');
         } catch (sendErr) {
           const smsg = (sendErr && sendErr.message) || String(sendErr);
           if (/message channel closed|asynchronous response|message port closed/i.test(smsg)) {
             console.log(`⏳ flow: response channel closed for prompt ${i + 1}; awaiting pushed result (no regeneration)...`);
+            logToExtension('info', 'Flow', `Response channel closed for prompt ${i + 1}; awaiting pushed result...`);
             result = await __flowWaiter.promise;
             if (!result) {
               throw new Error('Generation result not received after the response channel closed');
             }
+            markLoopProgress('flow_result');
+          } else if (/timed out waiting for generation result/i.test(smsg)) {
+            __flowWaiter.cancel();
+            throw sendErr;
           } else {
             __flowWaiter.cancel();
             // Content script unreachable -> force re-inject and retry once.
+            logToExtension('warn', 'Flow', `flowSubmitPrompt send failed (${smsg}); reinjecting content script and retrying once...`);
             await ensureTabContentScript(currentTabId, true);
             await sleep(400);
-            const __flowWaiter2 = registerResultWaiter(queue[i].id, 300000);
+            const __flowWaiter2 = registerResultWaiter(queue[i].id, 180000);
+            markLoopProgress('flow_submit_retry');
             try {
-              result = await ext.tabs.sendMessage(currentTabId, {
-                action: 'flowSubmitPrompt',
-                prompt: queue[i].prompt,
-                itemId: queue[i].id
-              });
+              result = await Promise.race([
+                ext.tabs.sendMessage(currentTabId, {
+                  action: 'flowSubmitPrompt',
+                  prompt: queue[i].prompt,
+                  itemId: queue[i].id
+                }),
+                __flowWaiter2.promise.then((r) => {
+                  if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result (retry)');
+                  return r;
+                })
+              ]);
               __flowWaiter2.cancel();
+              markLoopProgress('flow_result');
             } catch (sendErr2) {
               const smsg2 = (sendErr2 && sendErr2.message) || String(sendErr2);
               if (/message channel closed|asynchronous response|message port closed/i.test(smsg2)) {
@@ -797,6 +917,7 @@ async function runFlowSequentialGeneration(queue, delay) {
                 if (!result) {
                   throw new Error('Generation result not received after the response channel closed');
                 }
+                markLoopProgress('flow_result');
               } else {
                 __flowWaiter2.cancel();
                 throw sendErr2;
@@ -1052,21 +1173,66 @@ async function ensureTabContentScript(tabId, force) {
   if (tabId == null) return false;
   const scripting = (globalThis.chrome && globalThis.chrome.scripting) ||
     (globalThis.browser && globalThis.browser.scripting);
-  if (!scripting) return false;
+  if (!scripting) {
+    logToExtension('warn', 'Background', 'ensureTabContentScript: scripting API unavailable');
+    return false;
+  }
+  const EXECUTE_TIMEOUT_MS = 15000;
   try {
     if (!force) {
       try {
-        const probe = await scripting.executeScript({
-          target: { tabId },
-          func: () => !!window.__BULKYGEN_CS_LOADED__
-        });
-        if (probe && probe[0] && probe[0].result) return true;
-      } catch (_probeErr) { /* proceed to inject */ }
+        const probe = await withTimeout(
+          scripting.executeScript({
+            target: { tabId },
+            func: () => !!window.__BULKYGEN_CS_LOADED__
+          }),
+          EXECUTE_TIMEOUT_MS,
+          'content-script probe'
+        );
+        if (probe && probe[0] && probe[0].result) {
+          logToExtension('info', 'Background', `Content script already present on tab ${tabId}`);
+          return true;
+        }
+      } catch (_probeErr) {
+        logToExtension('warn', 'Background', `Content-script probe failed on tab ${tabId}: ${_probeErr?.message || _probeErr}; will inject.`);
+      }
     }
-    await scripting.executeScript({ target: { tabId }, files: ['ext.js', 'content.js'] });
+    logToExtension('info', 'Background', `Injecting content script into tab ${tabId}...`);
+    try {
+      await withTimeout(
+        scripting.executeScript({ target: { tabId }, files: ['ext.js', 'content.js'] }),
+        EXECUTE_TIMEOUT_MS,
+        'content-script inject'
+      );
+    } catch (injectErr) {
+      const imsg = (injectErr && injectErr.message) || String(injectErr);
+      // Re-injection of an already-initialized content.js throws on purpose.
+      // Also re-probe: Chrome sometimes wraps the thrown message.
+      if (/BULKYGEN_CS_ALREADY_INIT/i.test(imsg)) {
+        logToExtension('info', 'Background', `Content script already initialized on tab ${tabId}`);
+        return true;
+      }
+      try {
+        const reprobe = await withTimeout(
+          scripting.executeScript({
+            target: { tabId },
+            func: () => !!window.__BULKYGEN_CS_FULLY_INIT__
+          }),
+          5000,
+          'content-script re-probe'
+        );
+        if (reprobe && reprobe[0] && reprobe[0].result) {
+          logToExtension('info', 'Background', `Content script present after inject error on tab ${tabId}: ${imsg}`);
+          return true;
+        }
+      } catch (_re) { /* fall through */ }
+      throw injectErr;
+    }
     await sleep(300);
+    logToExtension('info', 'Background', `Content script injected into tab ${tabId}`);
     return true;
   } catch (e) {
+    logToExtension('warn', 'Background', `ensureTabContentScript failed on tab ${tabId}: ${e?.message || e}`);
     console.warn('ensureTabContentScript failed:', e);
     return false;
   }
@@ -1647,6 +1813,9 @@ function sanitizeFilename(name) {
       if (settings && settings.autonomousMode) {
         if (globalThis.bulkygenPipeline && !globalThis.bulkygenPipeline.isRunning) {
           console.log('BulkyGen: Auto-starting autonomous pipeline on boot');
+          startSwKeepAlive();
+          armKeepAliveAlarm();
+          ext.storage.local.set({ pipelineRunning: true }).catch(() => { });
           globalThis.bulkygenPipeline.start();
         }
       }

@@ -57,11 +57,38 @@
 
     /**
      * Wait for the existing generation loop to push a result for the given itemId.
-     * Times out after timeoutMs, but also probes the background every HEARTBEAT_MS
-     * to see whether the generation loop is still alive. If it has exited, we fail
-     * immediately instead of burning the full timeout doing nothing.
+     * Times out after timeoutMs, but also probes generation status every HEARTBEAT_MS.
+     * Fails fast if the loop exited, the worker is unreachable, OR the loop is
+     * stuck in a readiness phase with no progress (the silent-hang case).
      */
-    const HEARTBEAT_MS = 10000; // ping background every 10 seconds
+    const HEARTBEAT_MS = 10000; // ping every 10 seconds
+    const READINESS_STALL_MS = 45000; // ensure_cs / check_page must progress within 45s
+    const GENERATING_STALL_MS = 240000; // generating/flow_submit may take longer
+    const READINESS_PHASES = new Set([
+        'starting', 'finding_tab', 'ensure_cs', 'ensure_cs_done', 'check_page', 'recovered', 'aborted'
+    ]);
+
+    function _abortHungGeneration(reason) {
+        try {
+            if (globalThis.bulkygenGeneration?.abort) {
+                globalThis.bulkygenGeneration.abort(reason);
+                return;
+            }
+        } catch (e) { /* fall through */ }
+        try {
+            globalThis.ext?.runtime?.sendMessage({ action: 'abortGeneration', reason })?.catch(() => { });
+        } catch (e) { /* ignore */ }
+    }
+
+    function _getGenerationStatusSyncOrNull() {
+        try {
+            if (globalThis.bulkygenGeneration?.getStatus) {
+                return globalThis.bulkygenGeneration.getStatus();
+            }
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
     function _awaitGenerationResult(itemId, timeoutMs = 300000) {
         return new Promise((resolve, reject) => {
             let settled = false;
@@ -74,22 +101,47 @@
                 fn(arg);
             };
 
-            // Hard deadline — last-resort safety net
+            // Hard deadline — last-resort safety net. Also abort the SW loop so
+            // loopActive cannot stay true and poison the next record.
             const hardTimer = setTimeout(() => {
+                _abortHungGeneration(`pipeline hard timeout for itemId=${itemId}`);
                 settle(reject, new Error(`Generation timeout after ${timeoutMs / 1000}s for itemId=${itemId}`));
             }, timeoutMs);
 
-            // Periodic liveness probe: ask background if the loop is still running.
-            // If it's not, there is nothing that will ever deliver a result to us,
-            // so we fail fast and let the pipeline retry instead of idling 300 s.
             const heartbeat = setInterval(async () => {
                 if (settled) { clearInterval(heartbeat); return; }
                 try {
-                    const ext = globalThis.ext;
-                    if (!ext) return; // can't probe, keep waiting
-                    const res = await ext.runtime.sendMessage({ action: 'checkGenerationAlive' });
-                    if (res && res.alive === false) {
+                    let res = _getGenerationStatusSyncOrNull();
+                    if (!res) {
+                        const ext = globalThis.ext;
+                        if (!ext) return;
+                        res = await ext.runtime.sendMessage({ action: 'checkGenerationAlive' });
+                    }
+                    // Undefined/null response (self-message quirk) ⇒ treat as unknown, keep waiting
+                    // unless we can prove the loop is dead.
+                    if (!res) return;
+
+                    if (res.alive === false) {
                         settle(reject, new Error('Generation loop exited unexpectedly — no result will arrive for itemId=' + itemId));
+                        return;
+                    }
+
+                    const stalledMs = typeof res.stalledMs === 'number' ? res.stalledMs : null;
+                    const phase = res.phase || 'unknown';
+                    if (stalledMs != null) {
+                        if (READINESS_PHASES.has(phase) && stalledMs > READINESS_STALL_MS) {
+                            const reason = `Generation loop stalled in readiness phase="${phase}" for ${Math.round(stalledMs / 1000)}s`;
+                            log()?.warn(TAG, reason + ` — aborting (itemId=${itemId})`);
+                            _abortHungGeneration(reason);
+                            settle(reject, new Error(reason + ` for itemId=${itemId}`));
+                            return;
+                        }
+                        if ((phase === 'generating' || phase === 'flow_submit' || phase === 'flow_submit_retry') && stalledMs > GENERATING_STALL_MS) {
+                            const reason = `Generation loop stalled in phase="${phase}" for ${Math.round(stalledMs / 1000)}s`;
+                            log()?.warn(TAG, reason + ` — aborting (itemId=${itemId})`);
+                            _abortHungGeneration(reason);
+                            settle(reject, new Error(reason + ` for itemId=${itemId}`));
+                        }
                     }
                 } catch (e) {
                     // Message channel gone (worker restart) — also means loop is dead
@@ -161,23 +213,42 @@
             isPaused: false
         });
 
-        // Signal the existing startGeneration handler and actually check whether
-        // it took — previously this was fire-and-forget, so a dropped signal
-        // (e.g. a stale legacy loop still marked active in this worker) meant
-        // waiting the full 300s timeout with zero information about why.
-        let startAck;
+        // Register the waiter BEFORE starting generation so early failures
+        // (no tab / checkPage fail) cannot be delivered into a void and leave
+        // us hanging for 300s.
+        log()?.info(TAG, `Waiting for generation result for item ${itemId}...`);
+        const resultPromise = _awaitGenerationResult(itemId, 300000);
+
+        // Prefer in-process start (same service worker) — avoids unreliable
+        // chrome.runtime.sendMessage self-calls that can resolve to null/undefined
+        // without ever invoking startGeneration.
+        let startAck = null;
         try {
-            startAck = await ext.runtime.sendMessage({ action: 'startGeneration' });
+            if (globalThis.bulkygenGeneration?.tryStart) {
+                startAck = globalThis.bulkygenGeneration.tryStart();
+            } else {
+                startAck = await ext.runtime.sendMessage({ action: 'startGeneration' });
+            }
         } catch (e) {
-            startAck = null; // no listener / extension context issue
+            startAck = null;
+            log()?.warn(TAG, `startGeneration signal failed: ${e?.message || e}`);
         }
-        if (startAck && startAck.started === false) {
-            throw new Error(`startGeneration was rejected by background (${startAck.reason || 'unknown reason'}) — a previous generation loop is likely still active`);
+
+        if (!startAck || startAck.started !== true) {
+            const reason = startAck?.reason || (startAck == null ? 'no_ack' : 'unknown');
+            _abortHungGeneration(`startGeneration not acknowledged (${reason})`);
+            // Reject the waiter if still pending so we don't double-wait
+            try {
+                deliverGenerationResult(itemId, {
+                    success: false,
+                    error: `startGeneration was not started (reason=${reason})`
+                });
+            } catch (e) { /* ignore */ }
+            throw new Error(`startGeneration was rejected by background (${reason}) — a previous generation loop is likely still active`);
         }
 
         // ── Stage 3: Wait for image result ─────────────────────────────────────
-        log()?.info(TAG, `Waiting for generation result for item ${itemId}...`);
-        const result = await _awaitGenerationResult(itemId, 300000);
+        const result = await resultPromise;
 
         if (!result || !result.success || (!result.imageData && !(result.multipleImages?.length))) {
             const err = result?.error || 'No image data returned';
@@ -203,7 +274,7 @@
 
         // Build watermark options: per-record fields take priority; global settings are the fallback.
         const wm = {
-            enabled: record.watermarkEnabled !== undefined ? record.watermarkEnabled : settings.watermarkEnabled,
+            enabled: record.watermarkEnabled === true ? true : settings.watermarkEnabled,
             text: record.watermarkText !== undefined ? record.watermarkText : settings.watermarkText,
             logoUrl: record.watermarkLogoUrl !== undefined ? record.watermarkLogoUrl : settings.watermarkLogoUrl,
             opacity: record.watermarkOpacity !== undefined ? record.watermarkOpacity : settings.watermarkOpacity,
@@ -223,7 +294,7 @@
 
         // ── Stage 5: Embed metadata ────────────────────────────────────────────
         // metadataEnabled in global settings gates this stage. Per-record fields override globals.
-        const metaEnabled = settings.metadataEnabled !== false; // default true
+        const metaEnabled = record.metadataEnabled === true ? true : (settings.metadataEnabled !== false);
         let finalDataUrl = processed.dataUrl;
         let metadataWritten = false;
         if (metaEnabled && meta()?.isSupported() && finalDataUrl && finalDataUrl.startsWith('data:image/jpeg')) {
@@ -300,7 +371,7 @@
         const finalBlobHashBlob = dataUrlToBlob(finalDataUrl);
         const finalSha256 = await computeSha256(finalBlobHashBlob);
 
-        // ── Stage 7: Update Supabase record ────────────────────────────────────
+        // ── Stage 7: Update Supabase record ────────────────--------------------
         const processingTimeMs = Date.now() - processingStartMs;
         const totalTimeMs = Date.now() - startMs;
 
@@ -316,7 +387,7 @@
                 processing_time: Math.round(processingTimeMs / 1000),
                 upload_time: Math.round(uploadTimeMs / 1000),
                 metadata_written: metadataWritten,
-                watermark: !!record.watermarkEnabled,
+                watermark: !!wm.enabled,
                 compression: settings.jpegQuality,
                 image_format: 'jpeg',
                 sha256: finalSha256,
@@ -332,6 +403,7 @@
             updated_at: new Date().toISOString(),
             error_message: null,
             worker_id: deviceStr,
+            generated_by: deviceStr,
             metadata: newMeta
         };
 
@@ -400,7 +472,8 @@
                             attempts: currentAttempts,
                             error_message: lastError.message,
                             updated_at: new Date().toISOString(),
-                            worker_id: deviceStr
+                            worker_id: deviceStr,
+							generated_by: deviceStr
                         });
                     } catch (e) {
                         log()?.warn(TAG, `Could not update retry status in Supabase: ${e.message}`);
@@ -426,7 +499,8 @@
                     attempts: currentAttempts,
                     error_message: null,
                     updated_at: new Date().toISOString(),
-                    worker_id: deviceStr
+                    worker_id: deviceStr,
+					generated_by: deviceStr
                 });
             } catch (e) {
                 log()?.warn(TAG, `Could not reset record ${record.id} to pending after stop: ${e.message}`);
@@ -445,7 +519,8 @@
                 attempts: currentAttempts,
                 error_message: lastError?.message || 'Unknown error',
                 updated_at: new Date().toISOString(),
-                worker_id: deviceStr
+                worker_id: deviceStr,
+				generated_by: deviceStr
             });
         } catch (e) {
             log()?.warn(TAG, `Could not mark record ${record.id} as failed in Supabase: ${e.message}`);
@@ -551,9 +626,14 @@
             _forceRun = force;
             log()?.info(TAG, `Autonomous pipeline starting (force=${force})`);
 
+            // Keep pipelineRunning in sync for the keepalive/watchdog alarm.
+            // Auto-start used to skip this, so the alarm could race-start
+            // generation against a stale genTabId while the pipeline also started.
+            try {
+                await globalThis.ext?.storage?.local?.set({ pipelineRunning: true });
+            } catch (e) { /* non-fatal */ }
+
             // Reclaim any records left stuck at status='processing' by a worker
-            // that got killed mid-run in a previous session — otherwise they're
-            // invisible to fetchPendingRecord() forever.
             try {
                 const settings = await cfg()?.get();
                 if (settings) {
@@ -593,8 +673,15 @@
             // Explicitly stopping the background loop here keeps its state in
             // sync with the pipeline so the next record can actually start.
             try {
-                globalThis.ext?.runtime?.sendMessage({ action: 'stopGeneration' })?.catch(() => { });
+                if (globalThis.bulkygenGeneration?.abort) {
+                    globalThis.bulkygenGeneration.abort('pipeline stop');
+                } else {
+                    globalThis.ext?.runtime?.sendMessage({ action: 'stopGeneration' })?.catch(() => { });
+                }
             } catch (e) { /* no listener / context gone — non-fatal */ }
+            try {
+                globalThis.ext?.storage?.local?.set({ pipelineRunning: false })?.catch?.(() => { });
+            } catch (e) { /* ignore */ }
 
             log()?.info(TAG, 'Autonomous pipeline stop requested');
         },

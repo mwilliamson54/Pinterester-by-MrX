@@ -54,9 +54,12 @@
      * @returns {Promise<void>}
      */
     async function markProcessing(cfg, id) {
-        await _patch(cfg, id, { 
+		const deviceStr = cfg.deviceName || (globalThis.navigator && globalThis.navigator.userAgent) || 'Unknown Device';
+        await _patch(cfg, id, {
             status: 'processing',
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
+            generated_by: deviceStr,
+            worker_id: deviceStr
         });
     }
 
@@ -129,10 +132,13 @@
      * @returns {Promise<void>}
      */
     async function markFailed(cfg, id, errorMsg) {
+		const deviceStr = cfg.deviceName || (globalThis.navigator && globalThis.navigator.userAgent) || 'Unknown Device';
         await _patch(cfg, id, {
             status: 'failed',
             error_message: errorMsg || 'Unknown error',
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
+            generated_by: deviceStr,
+            worker_id: deviceStr
         });
     }
 
@@ -222,15 +228,54 @@
             folder: meta.folder || null,
 
             // Watermark options
-            watermarkEnabled: meta.watermark?.enabled || false,
-            watermarkText: meta.watermark?.text || null,
-            watermarkLogoUrl: meta.watermark?.logo || null,
-            watermarkOpacity: meta.watermark?.opacity || null,
-            watermarkPosition: meta.watermark?.position || null,
-            watermarkRotation: meta.watermark?.rotation || null,
-            watermarkFont: meta.watermark?.font || null,
-            watermarkScale: meta.watermark?.scale || null,
-            watermarkMargin: meta.watermark?.margin || null,
+            watermarkEnabled: (meta.watermark_enabled !== undefined) ? meta.watermark_enabled :
+                               (meta.watermarkEnabled !== undefined) ? meta.watermarkEnabled :
+                               (typeof meta.watermark === 'boolean') ? meta.watermark :
+                               (meta.watermark && meta.watermark.enabled !== undefined) ? meta.watermark.enabled :
+                               (meta.watermark === false) ? false :
+                               undefined,
+            watermarkText: meta.watermark_text !== undefined ? meta.watermark_text :
+                           meta.watermarkText !== undefined ? meta.watermarkText :
+                           meta.watermark?.text !== undefined ? meta.watermark.text :
+                           undefined,
+            watermarkLogoUrl: meta.watermark_logo_url !== undefined ? meta.watermark_logo_url :
+                              meta.watermark_logo !== undefined ? meta.watermark_logo :
+                              meta.watermarkLogoUrl !== undefined ? meta.watermarkLogoUrl :
+                              meta.watermark?.logoUrl !== undefined ? meta.watermark.logoUrl :
+                              meta.watermark?.logo !== undefined ? meta.watermark.logo :
+                              undefined,
+            watermarkOpacity: meta.watermark_opacity !== undefined ? meta.watermark_opacity :
+                              meta.watermarkOpacity !== undefined ? meta.watermarkOpacity :
+                              meta.watermark?.opacity !== undefined ? meta.watermark.opacity :
+                              undefined,
+            watermarkPosition: meta.watermark_position !== undefined ? meta.watermark_position :
+                               meta.watermarkPosition !== undefined ? meta.watermarkPosition :
+                               meta.watermark?.position !== undefined ? meta.watermark.position :
+                               undefined,
+            watermarkRotation: meta.watermark_rotation !== undefined ? meta.watermark_rotation :
+                               meta.watermarkRotation !== undefined ? meta.watermarkRotation :
+                               meta.watermark?.rotation !== undefined ? meta.watermark.rotation :
+                               undefined,
+            watermarkFont: meta.watermark_font !== undefined ? meta.watermark_font :
+                           meta.watermarkFont !== undefined ? meta.watermarkFont :
+                           meta.watermark?.font !== undefined ? meta.watermark.font :
+                           undefined,
+            watermarkScale: meta.watermark_scale !== undefined ? meta.watermark_scale :
+                            meta.watermarkScale !== undefined ? meta.watermarkScale :
+                            meta.watermark?.scale !== undefined ? meta.watermark.scale :
+                            undefined,
+            watermarkMargin: meta.watermark_margin !== undefined ? meta.watermark_margin :
+                             meta.watermarkMargin !== undefined ? meta.watermarkMargin :
+                             meta.watermark?.margin !== undefined ? meta.watermark.margin :
+                             undefined,
+
+            // Metadata options
+            metadataEnabled: (meta.metadata_enabled !== undefined) ? meta.metadata_enabled :
+                             (meta.metadataEnabled !== undefined) ? meta.metadataEnabled :
+                             (meta.metadata_written !== undefined) ? meta.metadata_written :
+                             (meta.metadataWritten !== undefined) ? meta.metadataWritten :
+                             (meta.metadata && meta.metadata.enabled !== undefined) ? meta.metadata.enabled :
+                             undefined,
 
             // Generation settings
             genQuality: meta.output?.quality || null,

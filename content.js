@@ -1,5 +1,11 @@
 // Marker so the side panel / background never double-inject this script.
 window.__BULKYGEN_CS_LOADED__ = true;
+// Stop re-evaluation before const/let redeclarations throw. ensureTabContentScript
+// treats this specific error as "already present" (success).
+if (window.__BULKYGEN_CS_FULLY_INIT__) {
+  throw new Error('BULKYGEN_CS_ALREADY_INIT');
+}
+window.__BULKYGEN_CS_FULLY_INIT__ = true;
 
 // Content script for Whisk + other platforms automation
 
@@ -1428,11 +1434,14 @@ function debugDOM() {
 // Whisk boot. We only run UI detection when the user starts generation.
 
 // Listen for messages from background
+// Guard against duplicate listeners when ensureTabContentScript re-injects this file.
+if (!window.__BULKYGEN_CS_LISTENER__) {
+window.__BULKYGEN_CS_LISTENER__ = true;
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'togglePanel') {
     togglePanel();
     sendResponse({ success: true });
-    return true;
+    return false;
   }
 
   if (message.action === 'generateImage') {
@@ -1511,14 +1520,16 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       __bgPersistKeepAlive = false; releaseKeepAlive();
     }
     sendResponse({ ok: true });
-    return true;
+    return false;
   }
 
   if (message.action === 'checkPage') {
     sendResponse({ provider: PROVIDER, isSupportedPage: PROVIDER !== 'unknown' });
+    return false;
   }
-  return true;
+  return false;
 });
+} // end __BULKYGEN_CS_LISTENER__ guard
 
 function collectResultElements() {
   const results = [];
