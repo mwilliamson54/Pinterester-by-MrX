@@ -361,6 +361,16 @@
 
             // Generation settings
             genQuality: meta.output?.quality || null,
+            // Aspect ratio to select in Flow before submitting, e.g. "16:9",
+            // "4:3", "1:1", "3:4", "9:16". Accepts either a top-level
+            // aspect_ratio/aspectRatio column or one nested under output/metadata.
+            aspectRatio: record.aspect_ratio !== undefined ? record.aspect_ratio :
+                         record.aspectRatio !== undefined ? record.aspectRatio :
+                         meta.aspect_ratio !== undefined ? meta.aspect_ratio :
+                         meta.aspectRatio !== undefined ? meta.aspectRatio :
+                         meta.output?.aspect_ratio !== undefined ? meta.output.aspect_ratio :
+                         meta.output?.aspectRatio !== undefined ? meta.output.aspectRatio :
+                         null,
 
             // Preserve entire raw record for forward compatibility
             _raw: record

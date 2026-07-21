@@ -201,7 +201,12 @@
             id: itemId,
             prompt,
             status: 'pending',
-            _pipelineRecordId: id
+            _pipelineRecordId: id,
+            // Per-record aspect ratio (e.g. "16:9") from Supabase, falling back
+            // to a global default in settings if the record didn't specify one.
+            aspectRatio: record.aspectRatio !== undefined && record.aspectRatio !== null
+                ? record.aspectRatio
+                : (settings.aspectRatio || null)
         }];
 
         const ext = globalThis.ext;

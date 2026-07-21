@@ -1492,7 +1492,7 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } catch (e) { /* ignore */ }
     };
-    submitFlowPrompt(message.prompt, message.itemId)
+    submitFlowPrompt(message.prompt, message.itemId, message.aspectRatio)
       .then(result => {
         __pushFlowResult(result);
         try { sendResponse(result); } catch (e) { /* channel may be closed */ }
@@ -2062,7 +2062,141 @@ async function generateImage(prompt, itemId) {
   }
 }
 
-async function submitFlowPrompt(prompt, itemId) {
+// ─────────────────────────────────────────────────────────────────────────
+// Flow aspect ratio selection
+// ─────────────────────────────────────────────────────────────────────────
+// Maps the aspect-ratio labels we accept from Supabase ("16:9", "4:3", "1:1",
+// "3:4", "9:16") to the Material Symbols ligature Flow renders for that
+// option (e.g. "crop_16_9"). This is used both to read which ratio is
+// CURRENTLY selected (from the settings-trigger button's icon) and to find
+// the matching tab inside the ratio popover — it's more stable than Radix's
+// auto-generated ids/classes, which change between page loads/builds.
+const FLOW_ASPECT_RATIO_ICONS = {
+  '16:9': 'crop_16_9',
+  '4:3': 'crop_landscape',
+  '1:1': 'crop_square',
+  '3:4': 'crop_portrait',
+  '9:16': 'crop_9_16'
+};
+
+// The settings/model trigger button (shows e.g. "🍌 Nano Banana 2  [icon] 1x")
+// that opens the popover containing Image/Video, aspect ratio, and 1x-4x
+// tabs. Identified by aria-haspopup="menu" plus an <i> icon whose ligature is
+// one of the known aspect-ratio icons, rather than by id/class.
+function findFlowRatioTriggerButton() {
+  const buttons = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'));
+  for (const btn of buttons) {
+    const icon = Array.from(btn.querySelectorAll('i'))
+      .find(i => Object.values(FLOW_ASPECT_RATIO_ICONS).includes((i.textContent || '').trim()));
+    if (icon) return { button: btn, icon };
+  }
+  return null;
+}
+
+// Read the currently-selected aspect ratio from the trigger button's icon.
+// Returns null if the button/icon can't be found or doesn't match a known ratio.
+function getFlowCurrentAspectRatio() {
+  const found = findFlowRatioTriggerButton();
+  if (!found) return null;
+  const iconText = (found.icon.textContent || '').trim();
+  const entry = Object.entries(FLOW_ASPECT_RATIO_ICONS).find(([, ic]) => ic === iconText);
+  return entry ? entry[0] : null;
+}
+
+// Inside the OPEN ratio popover, find the tab button for a given ratio
+// (e.g. "16:9"), matched by its own icon ligature.
+function findFlowRatioTabButton(ratio) {
+  const iconName = FLOW_ASPECT_RATIO_ICONS[ratio];
+  if (!iconName) return null;
+  const menu = document.querySelector('[data-radix-menu-content][data-state="open"]') ||
+    document.querySelector('[role="menu"][data-state="open"]') ||
+    document; // fall back to whole doc in case the open-state attr differs
+  const tabs = Array.from(menu.querySelectorAll('button[role="tab"]'));
+  for (const tab of tabs) {
+    const icon = tab.querySelector('i');
+    if (icon && (icon.textContent || '').trim() === iconName) return tab;
+  }
+  return null;
+}
+
+// Make sure Flow's aspect-ratio selector matches `targetRatio` before we
+// submit. No-op if it's already set correctly. Otherwise opens the settings
+// popover, clicks the matching ratio tab, confirms the change, and closes
+// the popover again so it doesn't sit on top of the composer/generate button.
+async function ensureFlowAspectRatio(targetRatio) {
+  if (!targetRatio) return { changed: false, reason: 'no ratio requested' };
+  const normalized = String(targetRatio).trim();
+  if (!FLOW_ASPECT_RATIO_ICONS[normalized]) {
+    console.warn('BulkyGen Flow: unrecognized aspect ratio requested:', targetRatio);
+    clientLog('warn', 'Flow', `Unrecognized aspect ratio "${targetRatio}" — expected one of 16:9, 4:3, 1:1, 3:4, 9:16. Leaving ratio unchanged.`);
+    return { changed: false, reason: 'unrecognized ratio' };
+  }
+
+  const current = getFlowCurrentAspectRatio();
+  if (current === normalized) {
+    console.log('BulkyGen Flow: aspect ratio already set to', normalized);
+    return { changed: false, reason: 'already set' };
+  }
+
+  const trigger = findFlowRatioTriggerButton();
+  if (!trigger) {
+    console.warn('BulkyGen Flow: could not find the aspect-ratio trigger button');
+    clientLog('warn', 'Flow', 'Could not find the aspect-ratio trigger button — Flow\'s markup may have changed.');
+    return { changed: false, reason: 'trigger not found' };
+  }
+
+  console.log(`BulkyGen Flow: switching aspect ratio ${current || '?'} -> ${normalized}`);
+
+  // Open the settings popover. Flow ignores plain synthetic clicks on these
+  // React-controlled buttons, so drive the real onClick from the main world
+  // (same trick used for the generate button — see forceClickViaBackground).
+  await forceClickViaBackground(trigger.button);
+
+  let tabBtn = null;
+  for (let i = 0; i < 20 && !tabBtn; i++) {
+    await waitUnthrottled(100);
+    tabBtn = findFlowRatioTabButton(normalized);
+  }
+
+  if (!tabBtn) {
+    console.warn('BulkyGen Flow: aspect ratio popover did not open, or no tab found for', normalized);
+    clientLog('warn', 'Flow', `Aspect ratio popover did not open (or tab not found) for "${normalized}".`);
+    pressKey(document.body, 'Escape', {});
+    return { changed: false, reason: 'tab not found' };
+  }
+
+  await forceClickViaBackground(tabBtn);
+
+  // Confirm the trigger's icon actually updated to the new ratio.
+  let confirmed = false;
+  for (let i = 0; i < 20; i++) {
+    await waitUnthrottled(100);
+    if (getFlowCurrentAspectRatio() === normalized) { confirmed = true; break; }
+  }
+
+  // Selecting a tab does not auto-close this popover (it's not a menuitem),
+  // so close it ourselves: Escape first, then a fallback re-click of the
+  // trigger if it's somehow still open.
+  pressKey(document.body, 'Escape', {});
+  await waitUnthrottled(150);
+  const stillOpen = trigger.button.getAttribute('aria-expanded') === 'true' ||
+    trigger.button.getAttribute('data-state') === 'open';
+  if (stillOpen) {
+    await forceClickViaBackground(trigger.button);
+    await waitUnthrottled(100);
+  }
+
+  if (!confirmed) {
+    console.warn('BulkyGen Flow: clicked ratio tab for', normalized, 'but could not confirm the trigger icon updated');
+    clientLog('warn', 'Flow', `Clicked the "${normalized}" ratio tab but couldn't confirm it took effect.`);
+  } else {
+    console.log('BulkyGen Flow: aspect ratio set to', normalized);
+    clientLog('info', 'Flow', `Aspect ratio set to ${normalized}.`);
+  }
+  return { changed: confirmed, reason: confirmed ? 'ok' : 'unconfirmed' };
+}
+
+async function submitFlowPrompt(prompt, itemId, aspectRatio) {
   if (PROVIDER !== 'flow') {
     clientLog('error', 'Flow', `submitFlowPrompt called but detected provider is "${PROVIDER}", not "flow" — the page BulkyGen is running on doesn't match a Flow project URL.`);
     throw new Error('Flow submit requested on non-Flow page');
@@ -2087,6 +2221,18 @@ async function submitFlowPrompt(prompt, itemId) {
       throw new Error('Could not find the Flow prompt box');
     }
     console.log('BulkyGen Flow: Found composer', editor.tagName, editor.className);
+
+    // --- Make sure the requested aspect ratio is selected BEFORE we type the
+    // prompt (this can open/close a popover and briefly steal focus, so do it
+    // first rather than after the composer already has text in it) ---
+    if (aspectRatio) {
+      try {
+        await ensureFlowAspectRatio(aspectRatio);
+      } catch (e) {
+        console.warn('BulkyGen Flow: ensureFlowAspectRatio threw:', e?.message || e);
+        clientLog('warn', 'Flow', `Aspect ratio selection failed: ${e?.message || e}`);
+      }
+    }
 
     const beforeKeys = new Set(
       collectResultElements().filter(el => el.tagName === 'IMG').map(elementKey)

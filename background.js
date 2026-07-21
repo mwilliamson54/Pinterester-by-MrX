@@ -865,7 +865,8 @@ async function runFlowSequentialGeneration(queue, delay) {
             ext.tabs.sendMessage(currentTabId, {
               action: 'flowSubmitPrompt',
               prompt: queue[i].prompt,
-              itemId: queue[i].id
+              itemId: queue[i].id,
+              aspectRatio: queue[i].aspectRatio || null
             }),
             __flowWaiter.promise.then((r) => {
               if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result');
@@ -900,7 +901,8 @@ async function runFlowSequentialGeneration(queue, delay) {
                 ext.tabs.sendMessage(currentTabId, {
                   action: 'flowSubmitPrompt',
                   prompt: queue[i].prompt,
-                  itemId: queue[i].id
+                  itemId: queue[i].id,
+                  aspectRatio: queue[i].aspectRatio || null
                 }),
                 __flowWaiter2.promise.then((r) => {
                   if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result (retry)');
@@ -1077,7 +1079,8 @@ async function regenerateSingleItem(itemId) {
     const response = await ext.tabs.sendMessage(currentTabId, {
       action: currentProvider === 'flow' ? 'flowSubmitPrompt' : 'generateImage',
       prompt: queue[idx].prompt,
-      itemId: queue[idx].id
+      itemId: queue[idx].id,
+      aspectRatio: queue[idx].aspectRatio || null
     });
 
     if (!response || !response.success) {
