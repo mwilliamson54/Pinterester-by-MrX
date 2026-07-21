@@ -186,8 +186,10 @@
             throw new Error('Pipeline stopped by user');
         }
 
-        // ── Stage 1: Mark processing in Supabase ──────────────────────────────
-        await supa()?.markProcessing(settings, id);
+        // ── Stage 1: Record was already atomically claimed (status → 'processing')
+        // by claimPendingRecord() before processRecord() was called, so no separate
+        // markProcessing() call is needed here (that used to be its own request,
+        // which is what created the race condition).
         await stats()?.setStatus('generating', prompt);
 
         // ── Stage 2: Feed prompt into the existing generation loop ────────────
@@ -565,7 +567,7 @@
         try {
             await stats()?.setStatus('waiting');
 
-            const rawRecord = await supa()?.fetchPendingRecord(settings);
+            const rawRecord = await supa()?.claimPendingRecord(settings);
             if (!rawRecord) {
                 // No pending records — wait for the configured poll interval
                 log()?.verbose(TAG, `No pending records — polling again in ${settings.pollIntervalMs}ms`);

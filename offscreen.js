@@ -133,15 +133,27 @@
         if (text) {
             const scaledSize = Math.round(parseInt(font) * scale) || 24;
             const fontFamily = font.replace(/^\d+px\s*/, '') || 'sans-serif';
-            ctx.font = `${scaledSize}px ${fontFamily}`;
+            ctx.font = `bold ${scaledSize}px ${fontFamily}`;
             ctx.textAlign = textAlign;
             ctx.textBaseline = textBaseline;
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-            // Shadow for readability
+
+            // A soft shadow behind everything for a bit of extra depth
             ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
             ctx.shadowBlur = 4;
             ctx.shadowOffsetX = 1;
             ctx.shadowOffsetY = 1;
+
+            // Black outline drawn first — this is what keeps the text visible
+            // on white/light backgrounds, where a plain white fill disappears.
+            ctx.lineJoin = 'round';
+            ctx.miterLimit = 2;
+            ctx.lineWidth = Math.max(2, Math.round(scaledSize * 0.09));
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+            ctx.strokeText(text, x, y);
+
+            // White fill on top of the outline
+            ctx.shadowColor = 'transparent'; // shadow already applied via the stroke pass
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
             ctx.fillText(text, x, y);
         }
 

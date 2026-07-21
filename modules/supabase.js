@@ -47,6 +47,88 @@
     }
 
     /**
+     * Atomically claim the next pending record: find the oldest pending row,
+     * then flip it to 'processing' in a single PATCH that only matches (and
+     * updates) the row if it is STILL status='pending' at that instant
+     * (status=eq.pending is part of the same request as id=eq.X). If another
+     * worker claimed it a moment earlier, zero rows match, the response comes
+     * back empty, and this function moves on to the next candidate instead of
+     * processing the same record twice.
+     *
+     * @param {Object} cfg
+     * @param {number} [maxAttempts=5] — how many candidate records to try before giving up
+     * @returns {Promise<Object|null>} the claimed record (already marked 'processing'), or null if nothing could be claimed
+     */
+    async function claimPendingRecord(cfg, maxAttempts = 5) {
+        const { supabaseUrl, supabaseAnonKey, supabaseTable } = cfg;
+        if (!supabaseUrl || !supabaseAnonKey || !supabaseTable) {
+            throw new Error('Supabase not configured (missing URL, key, or table name)');
+        }
+
+        const baseUrl = supabaseUrl.replace(/\/$/, '');
+        const deviceStr = cfg.deviceName || (globalThis.navigator && globalThis.navigator.userAgent) || 'Unknown Device';
+        const triedIds = new Set();
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            // 1) Find a candidate pending record (skip ones we already failed to claim this round)
+            const excludeClause = triedIds.size > 0
+                ? `&id=not.in.(${[...triedIds].join(',')})`
+                : '';
+            const findUrl = `${baseUrl}/rest/v1/${encodeURIComponent(supabaseTable)}` +
+                `?status=eq.pending` +
+                excludeClause +
+                `&select=*` +
+                `&order=id.asc` +
+                `&limit=1`;
+
+            const findResponse = await fetch(findUrl, {
+                method: 'GET',
+                headers: _headers(supabaseAnonKey)
+            });
+
+            if (!findResponse.ok) {
+                const body = await findResponse.text().catch(() => '');
+                throw new Error(`Supabase fetch failed (${findResponse.status}): ${body}`);
+            }
+
+            const rows = await findResponse.json();
+            const candidate = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+            if (!candidate) return null; // nothing left to claim
+
+            triedIds.add(candidate.id);
+
+            // 2) Claim it — this only succeeds if status is still 'pending' right now.
+            const claimUrl = `${baseUrl}/rest/v1/${encodeURIComponent(supabaseTable)}` +
+                `?id=eq.${encodeURIComponent(candidate.id)}` +
+                `&status=eq.pending`;
+
+            const claimResponse = await fetch(claimUrl, {
+                method: 'PATCH',
+                headers: { ..._headers(supabaseAnonKey), 'Prefer': 'return=representation' },
+                body: JSON.stringify({
+                    status: 'processing',
+                    updated_at: new Date().toISOString(),
+                    generated_by: deviceStr,
+                    worker_id: deviceStr
+                })
+            });
+
+            if (!claimResponse.ok) {
+                const body = await claimResponse.text().catch(() => '');
+                throw new Error(`Supabase claim failed (${claimResponse.status}): ${body}`);
+            }
+
+            const claimedRows = await claimResponse.json().catch(() => []);
+            if (Array.isArray(claimedRows) && claimedRows.length > 0) {
+                return claimedRows[0]; // we won the race — this row is now ours
+            }
+            // Someone else claimed it first — loop and try the next candidate
+        }
+
+        return null; // gave up after maxAttempts without winning a claim
+    }
+
+    /**
      * Mark a record as 'processing' so another extension instance doesn't pick it up.
      *
      * @param {Object} cfg
@@ -317,6 +399,7 @@
 
     globalThis.bulkygenSupabase = {
         fetchPendingRecord,
+        claimPendingRecord,
         fetchPendingCount,
         markProcessing,
         updateRecord,
