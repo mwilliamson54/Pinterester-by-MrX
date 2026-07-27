@@ -664,6 +664,16 @@
             _stopFlag = true;
             _forceRun = false;
             if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+
+            // Clearing the pending poll timer above means _poll() will never
+            // run again on its own — so it will never reach its own
+            // "if (_stopFlag) { _running = false; ... }" reset at the top.
+            // If stop() is called while idle (between poll cycles, no record
+            // in flight), that leaves _running stuck at true forever, and
+            // every future start() call just logs "already running" and does
+            // nothing. Reset it here directly instead of depending on a poll
+            // cycle that may never happen again.
+            _running = false;
             for (const [itemId, waiter] of _pendingResults) {
                 clearTimeout(waiter.timer);
                 waiter.reject(new Error('Pipeline stopped by user'));
