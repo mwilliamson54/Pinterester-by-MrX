@@ -372,6 +372,22 @@
                          meta.output?.aspectRatio !== undefined ? meta.output.aspectRatio :
                          null,
 
+            // Output format + max size — new jsonb fields "filetype" / "max_size".
+            // filetype: "png" | "jpeg" | "webp". max_size: a number in KB, or
+            // "any"/blank/0 for unlimited.
+            fileType: meta.filetype !== undefined ? meta.filetype :
+                      meta.file_type !== undefined ? meta.file_type :
+                      meta.fileType !== undefined ? meta.fileType :
+                      meta.output?.filetype !== undefined ? meta.output.filetype :
+                      meta.output?.file_type !== undefined ? meta.output.file_type :
+                      null,
+            maxSizeKB: meta.max_size !== undefined ? meta.max_size :
+                       meta.maxSize !== undefined ? meta.maxSize :
+                       meta.max_size_kb !== undefined ? meta.max_size_kb :
+                       meta.maxSizeKb !== undefined ? meta.maxSizeKb :
+                       meta.output?.max_size !== undefined ? meta.output.max_size :
+                       null,
+
             // Preserve entire raw record for forward compatibility
             _raw: record
         };

@@ -2063,6 +2063,178 @@ async function generateImage(prompt, itemId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Flow "2K Upscaled" download capture
+// ─────────────────────────────────────────────────────────────────────────
+// The results grid only ever shows Flow's small on-page preview -- there is
+// no <img src> for the higher-resolution version. The only way to get it is
+// to actually open the tile's own "Download" menu and click "2K Upscaled",
+// same as a person would. That click triggers a REAL browser download, which
+// we catch on the background side (see flowArmDownloadWatch/
+// flowGetDownloadResult in background.js) instead of saving a file to disk.
+//
+// NOTE: Flow doesn't expose a stable id/class for the little download icon
+// that appears when you hover a result tile, so it's matched the same way
+// the rest of this file matches Flow's UI -- by visible text/icon/aria-label
+// -- rather than by id. If Flow changes this markup, capture2K will simply
+// fail fast and the pipeline falls back to the standard preview capture (see
+// submitFlowPrompt), so this is safe to leave on by default.
+
+// Find the tile container for a given result image (Flow tags each result
+// tile with a stable data-tile-id attribute, unlike its buttons/menus).
+function findFlowTileContainer(img) {
+  return img.closest('[data-tile-id]') || img.parentElement;
+}
+
+// Find the tile's "More" (⋮ three-dot) button -- this is what you have to
+// HOVER the tile to reveal, then click, to open the menu containing Download.
+// Matched by aria-label "More" or a "more_vert"/"more_horiz" icon ligature,
+// since Flow doesn't expose a stable id/class for it.
+function findFlowTileMoreButton(tile) {
+  if (!tile) return null;
+  const candidates = Array.from(tile.querySelectorAll('button, [role="button"]'));
+  for (const btn of candidates) {
+    const aria = normalizeText(btn.getAttribute('aria-label') || '');
+    const icon = Array.from(btn.querySelectorAll('i')).map(i => normalizeText(i.textContent || '')).join(' ');
+    if (aria === 'more' || aria.includes('more') || /more_vert|more_horiz/.test(icon)) return btn;
+  }
+  return null;
+}
+
+// Dispatch hover events only (no click) -- used for "Download", which must
+// be HOVERED (not clicked) to reveal the 1K/2K Upscaled submenu.
+function flowDispatchHover(el) {
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy };
+  const pBase = { ...base, pointerId: 1, isPrimary: true, pointerType: 'mouse' };
+  try { el.dispatchEvent(new PointerEvent('pointerover', pBase)); } catch { /* ignore */ }
+  try { el.dispatchEvent(new PointerEvent('pointerenter', pBase)); } catch { /* ignore */ }
+  try { el.dispatchEvent(new PointerEvent('pointermove', pBase)); } catch { /* ignore */ }
+  try { el.dispatchEvent(new MouseEvent('mouseover', base)); } catch { /* ignore */ }
+  try { el.dispatchEvent(new MouseEvent('mouseenter', base)); } catch { /* ignore */ }
+  try { el.dispatchEvent(new MouseEvent('mousemove', base)); } catch { /* ignore */ }
+}
+
+// Inside whichever menu is currently open, find the "Download" entry (it
+// itself opens a further submenu, aria-haspopup="menu" -- Flow nests the
+// 1K/2K Upscaled choices one level deeper, revealed on HOVER not click).
+function findFlowDownloadSubmenuTrigger() {
+  const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
+  for (const item of items) {
+    if (item.getAttribute('aria-haspopup') !== 'menu') continue;
+    if (normalizeText(item.textContent || '').startsWith('download')) return item;
+  }
+  return null;
+}
+
+// Find the "2K Upscaled" option itself, wherever it currently sits in the
+// DOM -- matched by text, not id/class, since Radix regenerates those ids.
+function findFlow2KUpscaledButton() {
+  const candidates = Array.from(document.querySelectorAll('button, [role="menuitem"]'));
+  for (const el of candidates) {
+    const text = normalizeText(el.textContent || '');
+    if (text.includes('2k') && text.includes('upscal')) return el;
+  }
+  return null;
+}
+
+// Opens the tile's menu and reveals the "2K Upscaled" option, following the
+// exact confirmed sequence:
+//   1. Hover the tile (reveals its floating toolbar)
+//   2. CLICK the ⋮ "More" button on that toolbar (opens the menu)
+//   3. HOVER (do NOT click) the "Download" entry in that menu -- this reveals
+//      a submenu with 1K / 2K Upscaled
+//   4. Return the "2K Upscaled" button once it appears, for the caller to click
+async function findAndOpenFlow2KOption(img) {
+  const tile = findFlowTileContainer(img);
+  if (!tile) {
+    console.log('BulkyGen Flow: 2K capture - could not find the tile container for this image');
+    return null;
+  }
+
+  // Step 1: hover the tile so its floating toolbar (with the ⋮ button) mounts/shows.
+  flowDispatchHover(tile);
+  await waitUnthrottled(200);
+
+  let moreBtn = null;
+  for (let i = 0; i < 15 && !moreBtn; i++) {
+    moreBtn = findFlowTileMoreButton(tile);
+    if (!moreBtn) await waitUnthrottled(120);
+  }
+  if (!moreBtn) {
+    console.log('BulkyGen Flow: 2K capture - could not find the tile\'s ⋮ "More" button');
+    return null;
+  }
+
+  // Step 2: click the ⋮ "More" button to open the menu.
+  await forceClickViaBackground(moreBtn);
+
+  let downloadEntry = null;
+  for (let i = 0; i < 15 && !downloadEntry; i++) {
+    await waitUnthrottled(120);
+    downloadEntry = findFlowDownloadSubmenuTrigger();
+  }
+  if (!downloadEntry) {
+    console.log('BulkyGen Flow: 2K capture - "Download" entry never appeared in the menu');
+    pressKey(document.body, 'Escape', {});
+    return null;
+  }
+
+  // Step 3: HOVER (not click) "Download" to reveal the 1K/2K Upscaled submenu.
+  flowDispatchHover(downloadEntry);
+
+  let btn = null;
+  for (let i = 0; i < 15 && !btn; i++) {
+    await waitUnthrottled(120);
+    btn = findFlow2KUpscaledButton();
+  }
+
+  if (!btn) {
+    console.log('BulkyGen Flow: 2K capture - "2K Upscaled" option never appeared');
+    pressKey(document.body, 'Escape', {});
+  }
+  return btn;
+}
+
+// Full 2K capture for one generated image tile: opens the menu, clicks
+// "2K Upscaled", catches the real browser download it triggers, and returns
+// the bytes as a data URL -- or null on any failure, so the caller can fall
+// back to the standard on-page preview capture.
+async function captureFlow2KUpscaled(img) {
+  try {
+    const armed = await ext.runtime.sendMessage({ action: 'flowArmDownloadWatch' });
+    if (!armed || !armed.success) {
+      console.log('BulkyGen Flow: 2K capture - could not arm the download watcher');
+      return null;
+    }
+
+    const button = await findAndOpenFlow2KOption(img);
+    if (!button) return null;
+
+    await forceSingleClickViaBackground(button);
+
+    const result = await ext.runtime.sendMessage({
+      action: 'flowGetDownloadResult',
+      watchId: armed.watchId,
+      timeoutMs: 15000
+    });
+
+    pressKey(document.body, 'Escape', {}); // close the menu again either way
+
+    if (result && result.success && result.dataUrl) {
+      console.log('BulkyGen Flow: 2K Upscaled captured successfully');
+      return result.dataUrl;
+    }
+    console.log('BulkyGen Flow: 2K capture failed:', result && result.error);
+    return null;
+  } catch (e) {
+    console.log('BulkyGen Flow: 2K capture threw:', e.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Flow aspect ratio selection
 // ─────────────────────────────────────────────────────────────────────────
 // Maps the aspect-ratio labels we accept from Supabase ("16:9", "4:3", "1:1",
@@ -2273,7 +2445,22 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
         const src = img.currentSrc || img.src || '';
         if (!src) continue;
         try {
-          const data = await getImageAsBase64(src, img);
+          let data = null;
+          let capturedAs2K = false;
+
+          // Prefer Flow's real "2K Upscaled" download; fall back to the
+          // plain on-page preview if that doesn't pan out for any reason.
+          try {
+            data = await captureFlow2KUpscaled(img);
+            if (data) capturedAs2K = true;
+          } catch (e2k) {
+            console.log('BulkyGen Flow: 2K attempt threw, falling back to standard capture:', e2k.message);
+          }
+
+          if (!data) {
+            data = await getImageAsBase64(src, img);
+          }
+
           if (data) {
             if (__capturedDataUrls.has(data)) {
               console.log('BulkyGen Flow: skipping duplicate of an already-captured image');
@@ -2288,7 +2475,8 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
                 ...meta,
                 src,
                 width: img.naturalWidth || img.width || 0,
-                height: img.naturalHeight || img.height || 0
+                height: img.naturalHeight || img.height || 0,
+                resolution: capturedAs2K ? '2K' : undefined
               }
             });
           }
@@ -2546,6 +2734,27 @@ async function forceClickViaBackground(btn) {
     return res;
   } catch (e) {
     console.log('BulkyGen Flow: force-click error:', e.message);
+    return null;
+  } finally {
+    try { btn.removeAttribute('data-bulkygen-submit'); } catch { /* ignore */ }
+  }
+}
+
+// Single-shot version of forceClickViaBackground -- fires the real click
+// exactly once instead of twice (see mainWorldSingleClick in background.js).
+// forceClickViaBackground deliberately double-fires as a safety measure that
+// is harmless for buttons with a disabled-state lock (generate button, ratio
+// tabs), but Flow's "2K Upscaled" button has no such lock, so double-firing
+// it was triggering 2-3 real file downloads per click. Used only for that click.
+async function forceSingleClickViaBackground(btn) {
+  if (!btn) return null;
+  try {
+    btn.setAttribute('data-bulkygen-submit', '1');
+    const res = await ext.runtime.sendMessage({ action: 'flowSingleForceClick' });
+    try { console.log('BulkyGen Flow: single force-click ->', JSON.stringify(res && res.result ? res.result : res)); } catch { /* ignore */ }
+    return res;
+  } catch (e) {
+    console.log('BulkyGen Flow: single force-click error:', e.message);
     return null;
   } finally {
     try { btn.removeAttribute('data-bulkygen-submit'); } catch { /* ignore */ }

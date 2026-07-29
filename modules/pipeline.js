@@ -32,6 +32,51 @@
     const auth = () => globalThis.bulkygenGoogleAuth;
     const drive = () => globalThis.bulkygenGoogleDrive;
 
+    // Maps a requested file type (any spelling) to the file extension to use.
+    function extensionForFileType(v) {
+        const s = String(v || 'jpeg').trim().toLowerCase().replace(/^image\//, '');
+        if (s === 'png') return 'png';
+        if (s === 'webp') return 'webp';
+        return 'jpg';
+    }
+
+    /**
+     * Resolve the output file type + max size for a record, per-record fields
+     * ("filetype" / "max_size" in the metadata jsonb) taking priority over the
+     * global settings fallback. "max_size" may be a number (KB) or the string
+     * "any" (or blank/0) meaning unlimited.
+     *
+     * Metadata embedding (Stage 5) happens AFTER this compression pass and
+     * adds a few more KB on top, for any of the three supported formats (JPEG
+     * APP1 markers, PNG chunks, or WebP RIFF chunks) -- without reserving
+     * headroom here, a "compress to 100KB" pass could come back out a few KB
+     * over once metadata is written in.
+     */
+    function buildImageProcessingCfg(record, settings) {
+        const rawFileType = (record.fileType !== undefined && record.fileType !== null && record.fileType !== '')
+            ? record.fileType : settings.outputFileType;
+
+        const rawMaxSize = (record.maxSizeKB !== undefined && record.maxSizeKB !== null && record.maxSizeKB !== '')
+            ? record.maxSizeKB : settings.maxSizeKB;
+        const isUnlimited = rawMaxSize === null || rawMaxSize === undefined || rawMaxSize === '' ||
+            (typeof rawMaxSize === 'string' && rawMaxSize.trim().toLowerCase() === 'any') ||
+            !isFinite(parseFloat(rawMaxSize)) || parseFloat(rawMaxSize) <= 0;
+        const requestedMaxSizeKB = isUnlimited ? null : Math.abs(parseFloat(rawMaxSize));
+
+        const willEmbedMetadata = record.metadataEnabled === true || (record.metadataEnabled === undefined && settings.metadataEnabled !== false);
+        const metadataHeadroomKB = willEmbedMetadata ? 3 : 0;
+        const compressionTargetKB = requestedMaxSizeKB ? Math.max(1, requestedMaxSizeKB - metadataHeadroomKB) : null;
+
+        return {
+            jpegQuality: settings.jpegQuality,
+            fileType: rawFileType,
+            maxSizeKB: compressionTargetKB,
+            // Kept for Stage 5's post-embedding size safety check (see below).
+            requestedMaxSizeKB
+        };
+    }
+
+
     // ── Internal state ───────────────────────────────────────────────────────────
     let _running = false;   // is the autonomous loop active?
     let _stopFlag = false;   // set to true to halt after current record
@@ -292,8 +337,9 @@
             margin: record.watermarkMargin !== undefined ? record.watermarkMargin : settings.watermarkMargin
         };
 
-        const processed = await canvas()?.processImage(imageDataUrl, wm, { jpegQuality: settings.jpegQuality })
-            || { dataUrl: imageDataUrl, width: 0, height: 0 };
+        const processingCfg = buildImageProcessingCfg(record, settings);
+        const processed = await canvas()?.processImage(imageDataUrl, wm, processingCfg)
+            || { dataUrl: imageDataUrl, width: 0, height: 0, mimeType: 'image/jpeg' };
 
         // ── Stage 4.5: Generate Processing Hash ───────────────────────────────
         const processingHashStr = `${record.prompt}|${settings.jpegQuality}|${wm.enabled}|${JSON.stringify(record._raw?.metadata || {})}`;
@@ -301,12 +347,16 @@
 
         // ── Stage 5: Embed metadata ────────────────────────────────────────────
         // metadataEnabled in global settings gates this stage. Per-record fields override globals.
+        // Supported for JPEG (EXIF/XMP via APP1 markers), PNG (tEXt/iTXt + eXIf
+        // chunks), and WebP (RIFF EXIF/XMP chunks) — same metadata fields either way.
         const metaEnabled = record.metadataEnabled === true ? true : (settings.metadataEnabled !== false);
         let finalDataUrl = processed.dataUrl;
         let metadataWritten = false;
-        if (metaEnabled && meta()?.isSupported() && finalDataUrl && finalDataUrl.startsWith('data:image/jpeg')) {
+        const finalMime = (finalDataUrl && finalDataUrl.match(/^data:([^;]+);/)?.[1]) || '';
+        const metadataSupportedForFormat = finalMime === 'image/jpeg' || finalMime === 'image/png' || finalMime === 'image/webp';
+        if (metaEnabled && meta()?.isSupported() && finalDataUrl && metadataSupportedForFormat) {
             try {
-                const jpegBlob = dataUrlToBlob(finalDataUrl);
+                const sourceBlob = dataUrlToBlob(finalDataUrl);
                 const metadataToEmbed = {
                     schema_version: 1,
                     seo: {
@@ -335,9 +385,21 @@
                         created_at: new Date().toISOString()
                     }
                 };
-                const embeddedBlob = await meta().embedMetadata(jpegBlob, metadataToEmbed);
-                finalDataUrl = await blobToDataUrl(embeddedBlob);
-                metadataWritten = true;
+                const embeddedBlob = await meta().embedMetadata(sourceBlob, metadataToEmbed, {
+                    width: processed.width,
+                    height: processed.height
+                });
+
+                // Metadata embedding happens AFTER compression, so it can push
+                // a file that was right at the requested size cap over the
+                // top. The size limit is a hard requirement, so if embedding
+                // broke it, keep the compressed-but-unlabeled version instead.
+                if (processingCfg.requestedMaxSizeKB && embeddedBlob.size > processingCfg.requestedMaxSizeKB * 1024) {
+                    log()?.warn(TAG, `Metadata embedding pushed file over the ${processingCfg.requestedMaxSizeKB}KB cap (${Math.round(embeddedBlob.size / 1024)}KB) — keeping compressed image without metadata instead.`);
+                } else {
+                    finalDataUrl = await blobToDataUrl(embeddedBlob);
+                    metadataWritten = true;
+                }
             } catch (err) {
                 log()?.error(TAG, `Metadata embedding failure: ${err.message}`);
             }
@@ -359,14 +421,15 @@
             }
 
             let filename;
+            const outExt = extensionForFileType(processingCfg.fileType);
             if (record.filename && record.filename.trim() !== '') {
                 filename = record.filename.trim().replace(/\s+/g, '-');
                 if (!/\.(jpe?g|png|gif|webp)$/i.test(filename)) {
-                    filename += '.jpeg';
+                    filename += '.' + outExt;
                 }
             } else {
                 const basename = record.prompt;
-                filename = formatFilename(settings.driveNamingTemplate, basename, record.id);
+                filename = formatFilename(settings.driveNamingTemplate, basename, record.id, outExt);
             }
             const finalBlob = dataUrlToBlob(finalDataUrl);
 
@@ -395,8 +458,9 @@
                 upload_time: Math.round(uploadTimeMs / 1000),
                 metadata_written: metadataWritten,
                 watermark: !!wm.enabled,
-                compression: settings.jpegQuality,
-                image_format: 'jpeg',
+                compression: processed.quality !== undefined ? processed.quality : settings.jpegQuality,
+                image_format: (processed.mimeType || 'image/jpeg').replace(/^image\//, ''),
+                requested_max_size_kb: processingCfg.requestedMaxSizeKB || null,
                 sha256: finalSha256,
                 processing_hash: processingHash
             }
@@ -753,11 +817,12 @@
         });
     }
 
-    function formatFilename(template, baseName, id) {
+    function formatFilename(template, baseName, id, ext) {
         const rawTemplate = template || '{index}-{date}';
         const cleanBase = sanitizeFilename(baseName || 'media');
         const dateStr = new Date().toISOString().slice(0, 10);
         const stamp = formatTimestampForName(Date.now());
+        const extension = (ext || 'jpg').replace(/^\./, '').toLowerCase();
 
         let out = rawTemplate
             .replace('{prompt}', cleanBase.substring(0, 60))
@@ -767,8 +832,8 @@
             .replace('{timestamp}', stamp)
             .replace('{index}', String(id));
 
-        if (!out.toLowerCase().endsWith('.jpg') && !out.toLowerCase().endsWith('.jpeg')) {
-            out += '.jpg';
+        if (!out.toLowerCase().endsWith('.' + extension)) {
+            out += '.' + extension;
         }
         return out;
     }

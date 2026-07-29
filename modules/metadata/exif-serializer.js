@@ -1,6 +1,8 @@
 /**
  * BulkyGen EXIF Serializer
- * Uses piexifjs to serialize mapped EXIF dictionary into JPEG.
+ * Uses piexifjs to serialize a mapped EXIF dictionary, either wrapped into a
+ * JPEG's APP1 marker (embed) or as the raw TIFF/EXIF byte blob that PNG's
+ * "eXIf" chunk and WebP's "EXIF" chunk both expect directly (buildRawExifBytes).
  */
 (function() {
     'use strict';
@@ -18,21 +20,9 @@
         return arr;
     }
 
-    /**
-     * Embeds EXIF data using piexif.
-     */
-    async function embed(jpegBlob, mappedExif) {
-        if (!globalThis.piexif || !mappedExif || Object.keys(mappedExif).length === 0) {
-            return jpegBlob;
-        }
-
-        const dataUrl = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(reader.result);
-            reader.onerror = reject;
-            reader.readAsDataURL(jpegBlob);
-        });
-
+    // Build the piexif exifObj ({ "0th": {...}, "Exif": {...}, ... }) from our
+    // mapped dot-notation dictionary (e.g. { "0th.ImageDescription": "..." }).
+    function buildExifObj(mappedExif) {
         const exifObj = {
             "0th": {},
             "Exif": {},
@@ -46,7 +36,7 @@
             if (parts.length === 2) {
                 const ifd = parts[0];
                 const tagStr = parts[1];
-                
+
                 // Get numeric tag ID from piexif. piexif exposes its tag
                 // dictionaries as ImageIFD / ExifIFD / GPSIFD / InteropIFD —
                 // not under the raw IFD section names used in mappedExif keys.
@@ -59,7 +49,7 @@
                 };
                 const dictName = dictNameMap[ifd] || ifd;
                 const tagId = piexif[dictName]?.[tagStr];
-                
+
                 if (tagId !== undefined) {
                     if (tagStr.startsWith('XP') && typeof value === 'string') {
                         exifObj[ifd][tagId] = stringToUcs2(value);
@@ -73,11 +63,51 @@
                 }
             }
         }
+        return exifObj;
+    }
+
+    /**
+     * Build the raw TIFF/EXIF byte blob (no JPEG APP1 wrapper) — the same
+     * format PNG's "eXIf" chunk and WebP's "EXIF" chunk both expect directly.
+     * @param {Object} mappedExif
+     * @returns {Uint8Array|null}
+     */
+    function buildRawExifBytes(mappedExif) {
+        if (!globalThis.piexif || !mappedExif || Object.keys(mappedExif).length === 0) return null;
+        try {
+            const exifObj = buildExifObj(mappedExif);
+            const exifBinaryString = piexif.dump(exifObj); // raw bytes, as a binary string
+            const bytes = new Uint8Array(exifBinaryString.length);
+            for (let i = 0; i < exifBinaryString.length; i++) {
+                bytes[i] = exifBinaryString.charCodeAt(i) & 0xFF;
+            }
+            return bytes;
+        } catch (e) {
+            console.error('EXIF byte build error:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Embeds EXIF data into a JPEG blob using piexif (APP1 marker).
+     */
+    async function embed(jpegBlob, mappedExif) {
+        if (!globalThis.piexif || !mappedExif || Object.keys(mappedExif).length === 0) {
+            return jpegBlob;
+        }
+
+        const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(jpegBlob);
+        });
 
         try {
+            const exifObj = buildExifObj(mappedExif);
             const exifBytes = piexif.dump(exifObj);
             const newJpegDataUrl = piexif.insert(exifBytes, dataUrl);
-            
+
             // convert back to blob
             const parts = newJpegDataUrl.split(',');
             const mime = parts[0].match(/:(.*?);/)[1];
@@ -95,6 +125,7 @@
     }
 
     globalThis.bulkygenExifSerializer = {
-        embed
+        embed,
+        buildRawExifBytes
     };
 })();

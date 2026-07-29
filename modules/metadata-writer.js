@@ -22,22 +22,23 @@
     const log = () => globalThis.bulkygenLogger;
 
     /**
-     * Public API to embed metadata into a JPEG blob.
-     * @param {Blob} jpegBlob — input JPEG blob
+     * Public API to embed metadata into an image blob (JPEG, PNG, or WebP).
+     * @param {Blob} imageBlob — input image blob
      * @param {Object} rawMetadata — structured metadata JSON from Supabase
-     * @returns {Promise<Blob>} JPEG blob with embedded metadata
+     * @param {Object} [opts] — { width, height } (needed for WebP, to synthesize its VP8X chunk)
+     * @returns {Promise<Blob>} image blob with embedded metadata
      */
-    async function embedMetadata(jpegBlob, rawMetadata) {
+    async function embedMetadata(imageBlob, rawMetadata, opts) {
         if (!globalThis.bulkygenMetadataEngine) {
             log()?.error(TAG, 'Metadata engine not loaded. Returning blob unchanged.');
-            return jpegBlob;
+            return imageBlob;
         }
 
         try {
-            return await globalThis.bulkygenMetadataEngine.processAndInject(jpegBlob, rawMetadata);
+            return await globalThis.bulkygenMetadataEngine.processAndInject(imageBlob, rawMetadata, opts);
         } catch (e) {
             log()?.error(TAG, 'Failed to embed metadata: ' + e.message);
-            return jpegBlob;
+            return imageBlob;
         }
     }
 

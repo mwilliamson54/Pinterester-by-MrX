@@ -64,25 +64,26 @@
      * Process an image data URL:
       *   1. Strip EXIF/metadata by re-drawing through OffscreenCanvas
       *   2. Apply watermark (if watermarkOptions.enabled === true)
-      *   3. Export as JPEG at the configured quality
+      *   3. Export as the requested file type, compressed to fit maxSizeKB if given
      *
      * Routes processing through the chrome offscreen document to access
      * DOM canvas APIs from background context.
      *
      * @param {string} inputDataUrl — data:image/... base64 string
      * @param {Object} [watermarkOptions] — from Supabase record
-     * @param {Object} [cfg] — { jpegQuality: 0.90 }
-     * @returns {Promise<{ dataUrl: string, width: number, height: number, mimeType: string }>}
+     * @param {Object} [cfg] — { jpegQuality: 0.90, fileType: 'jpeg'|'png'|'webp', maxSizeKB: 100|null }
+     * @returns {Promise<{ dataUrl: string, width: number, height: number, mimeType: string, quality?: number }>}
      */
     async function processImage(inputDataUrl, watermarkOptions, cfg) {
+        const inputMime = inputDataUrl?.match(/^data:([^;]+);/)?.[1] || 'image/jpeg';
+
         if (inputDataUrl && (inputDataUrl.startsWith('data:video/') || inputDataUrl.includes('video/mp4') || inputDataUrl.includes('video/webm'))) {
             log()?.info(TAG, 'Input is a video — passing through without canvas processing');
-            const mime = inputDataUrl.match(/^data:([^;]+);/)?.[1] || 'video/mp4';
             return {
                 dataUrl: inputDataUrl,
                 width: 0,
                 height: 0,
-                mimeType: mime
+                mimeType: inputMime
             };
         }
 
@@ -94,7 +95,7 @@
                 dataUrl: inputDataUrl,
                 width: 0,
                 height: 0,
-                mimeType: 'image/jpeg'
+                mimeType: inputMime
             };
         }
 
@@ -105,19 +106,22 @@
                 action: 'offscreenProcessImage',
                 dataUrl: inputDataUrl,
                 watermark: watermarkOptions,
-                jpegQuality: cfg?.jpegQuality || 0.90
+                jpegQuality: cfg?.jpegQuality || 0.90,
+                fileType: cfg?.fileType || null,
+                maxSizeKB: cfg?.maxSizeKB || null
             });
 
             if (!response || response.success === false) {
                 throw new Error(response?.error || 'Failed to process image in offscreen canvas');
             }
 
-            log()?.info(TAG, `Successfully processed image via offscreen: ${response.width}x${response.height}, quality=${cfg?.jpegQuality}`);
+            log()?.info(TAG, `Successfully processed image via offscreen: ${response.width}x${response.height}, format=${response.mimeType}, quality=${response.quality}, size=${response.size}B`);
             return {
                 dataUrl: response.dataUrl,
                 width: response.width,
                 height: response.height,
-                mimeType: response.mimeType
+                mimeType: response.mimeType,
+                quality: response.quality
             };
         } catch (err) {
             log()?.error(TAG, `Offscreen canvas processing failed: ${err.message}. Passing through original.`);
@@ -125,7 +129,7 @@
                 dataUrl: inputDataUrl,
                 width: 0,
                 height: 0,
-                mimeType: 'image/jpeg'
+                mimeType: inputMime
             };
         }
     }

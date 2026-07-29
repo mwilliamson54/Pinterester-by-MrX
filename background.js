@@ -13,6 +13,8 @@ importScripts('modules/metadata/metadata-mapper.js');
 importScripts('modules/metadata/xmp-serializer.js');
 importScripts('modules/metadata/exif-serializer.js');
 importScripts('modules/metadata/iptc-serializer.js');
+importScripts('modules/metadata/png-serializer.js');
+importScripts('modules/metadata/webp-serializer.js');
 importScripts('modules/metadata/metadata-engine.js');
 importScripts('modules/metadata-writer.js');
 importScripts('modules/googleAuth.js');
@@ -330,6 +332,26 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: true });
     });
     return true;
+  } else if (message.action === 'flowArmDownloadWatch') {
+    // Must be armed BEFORE the content script clicks "2K Upscaled", so this
+    // responds synchronously with a watchId to click against.
+    const watchId = armFlowDownloadWatch();
+    sendResponse({ success: true, watchId });
+    return false;
+  } else if (message.action === 'flowGetDownloadResult') {
+    waitForFlowDownloadResult(message.watchId, message.timeoutMs).then(result => {
+      sendResponse(result);
+    }).catch(error => {
+      sendResponse({ success: false, error: error.message });
+    });
+    return true; // async response
+  } else if (message.action === 'flowSingleForceClick') {
+    forceSingleClickInPage(sender?.tab?.id).then(result => {
+      sendResponse(result);
+    }).catch(error => {
+      sendResponse({ ok: false, error: error.message });
+    });
+    return true; // async response
   } else if (message.action === 'flowForceClick') {
     forceClickInPage(sender?.tab?.id).then(result => {
       sendResponse(result);
@@ -1352,6 +1374,93 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function forceSingleClickInPage(tabId) {
+  if (tabId == null) return { ok: false, error: 'no tab id' };
+  const scripting = (globalThis.chrome && globalThis.chrome.scripting) ||
+    (globalThis.browser && globalThis.browser.scripting);
+  if (!scripting) return { ok: false, error: 'scripting API unavailable' };
+  try {
+    const results = await scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: mainWorldSingleClick
+    });
+    const out = results && results[0] ? results[0].result : null;
+    console.log('BulkyGen Flow: single force-click result', out);
+    return { ok: true, result: out };
+  } catch (e) {
+    console.error('forceSingleClickInPage failed:', e);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Same idea as mainWorldForceClick above, but fires the button's action
+// EXACTLY ONCE: either the real React onClick handler, OR (only if none was
+// found at all) a single native click -- never both. mainWorldForceClick
+// deliberately fires both a manual handler call AND a full native click
+// sequence as a belt-and-suspenders measure, which is harmless for buttons
+// guarded by a disabled-state lock (generate button, ratio tabs) but was
+// producing 2-3 real file downloads per click on Flow's "2K Upscaled"
+// button, which has no such lock. Used only for that click.
+function mainWorldSingleClick() {
+  const out = { found: false, calledOnClick: false, dispatched: false, handlerDepth: -1, info: '' };
+  try {
+    const el = document.querySelector('[data-bulkygen-submit="1"]');
+    if (!el) { out.info = 'target not found'; return out; }
+    out.found = true;
+
+    const makeEvent = (type, node) => ({
+      type, bubbles: true, cancelable: true, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { }, stopImmediatePropagation() { },
+      isPropagationStopped: () => false,
+      isDefaultPrevented() { return this.defaultPrevented; },
+      persist() { }, nativeEvent: { isTrusted: true, type, bubbles: true, cancelable: true, button: 0, buttons: 1, detail: 1, view: window, clientX: 0, clientY: 0, screenX: 0, screenY: 0, pageX: 0, pageY: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5, target: node, currentTarget: node, preventDefault() { }, stopPropagation() { }, stopImmediatePropagation() { }, composedPath: () => [node] }, currentTarget: node, target: node,
+      button: 0, buttons: 1, detail: 1, view: window, isTrusted: true,
+      clientX: 0, clientY: 0, pointerId: 1, pointerType: 'mouse'
+    });
+
+    let node = el, depth = 0, handler = null, handlerNode = null;
+    while (node && depth < 8) {
+      let props = null;
+      const pk = Object.keys(node).find(k => k.indexOf('__reactProps$') === 0);
+      if (pk && node[pk]) props = node[pk];
+      if (!props) {
+        const fk = Object.keys(node).find(k => k.indexOf('__reactFiber$') === 0);
+        if (fk && node[fk] && node[fk].memoizedProps) props = node[fk].memoizedProps;
+      }
+      if (props && typeof props.onClick === 'function') {
+        handler = props; handlerNode = node; out.handlerDepth = depth; break;
+      }
+      node = node.parentElement; depth++;
+    }
+
+    if (handler) {
+      try {
+        handler.onClick(makeEvent('click', handlerNode));
+        out.calledOnClick = true;
+      } catch (e) { out.info += ' handler err: ' + e.message; }
+    } else {
+      // No React onClick found anywhere -- fall back to a single real click.
+      try {
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0 };
+        const p = { ...base, pointerId: 1, isPrimary: true, pointerType: 'mouse' };
+        el.dispatchEvent(new PointerEvent('pointerdown', { ...p, buttons: 1 }));
+        el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+        el.dispatchEvent(new PointerEvent('pointerup', { ...p, buttons: 0 }));
+        el.dispatchEvent(new MouseEvent('mouseup', base));
+        el.dispatchEvent(new MouseEvent('click', base));
+        out.dispatched = true;
+      } catch (e) { out.info += ' dispatch err: ' + e.message; }
+    }
+  } catch (e) {
+    out.info += ' fatal: ' + e.message;
+  }
+  return out;
+}
+
 // Fetch cross-origin image as base64 (background script can bypass CORS)
 async function fetchImageAsBase64(imageUrl) {
   try {
@@ -1416,6 +1525,101 @@ async function fetchImageAsBase64(imageUrl) {
       error: error.message
     };
   }
+}
+
+// ── Flow "2K Upscaled" download capture ─────────────────────────────────────
+// Flow's 2K option is a REAL browser download (a file lands in the user's
+// Downloads folder) -- unlike every other capture path in this extension,
+// which just reads an <img src>. So: arm this watcher BEFORE the content
+// script clicks "2K Upscaled", catch the download it triggers, re-fetch the
+// bytes ourselves (background can bypass CORS), then delete the on-disk copy
+// again so nothing is left cluttering the user's Downloads folder.
+//
+// One click was observed to sometimes produce 2-3 real downloads (the
+// original click routine fired the button's handler more than once as a
+// belt-and-suspenders measure that's harmless for buttons with a disabled-
+// state lock, but not for a plain Download button -- see
+// forceSingleClickViaBackground in content.js, used for this click instead).
+// As a second line of defence, ANY extra download that starts while a watch
+// is active (or shortly after it resolves) is treated as a duplicate of the
+// same click and deleted too, so nothing is left behind either way.
+const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt }
+const FLOW_DOWNLOAD_DEDUPE_GRACE_MS = 4000;
+
+function armFlowDownloadWatch() {
+  const watchId = `w-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  __flowDownloadWatchers.set(watchId, { downloadId: null, resolved: false, result: null, resolvedAt: null });
+  return watchId;
+}
+
+async function removeDownload(id, reason) {
+  console.log(`BulkyGen Flow: removing ${reason} download id=${id}`);
+  try { await ext.downloads.removeFile(id); } catch (e) { /* ignore */ }
+  try { await ext.downloads.erase({ id }); } catch (e) { /* ignore */ }
+}
+
+ext.downloads?.onCreated?.addListener(async (item) => {
+  // Attach to the oldest still-unmatched watcher.
+  for (const entry of __flowDownloadWatchers.values()) {
+    if (!entry.downloadId && !entry.resolved) {
+      entry.downloadId = item.id;
+      console.log('BulkyGen Flow: 2K download started, id=' + item.id + ' file=' + item.filename);
+      return;
+    }
+  }
+  // Otherwise, if any watcher is still active or resolved very recently,
+  // this is almost certainly an extra download from the same click -- remove it.
+  const now = Date.now();
+  for (const entry of __flowDownloadWatchers.values()) {
+    if (!entry.resolved || (entry.resolvedAt && now - entry.resolvedAt < FLOW_DOWNLOAD_DEDUPE_GRACE_MS)) {
+      await removeDownload(item.id, 'duplicate');
+      return;
+    }
+  }
+});
+
+ext.downloads?.onChanged?.addListener(async (delta) => {
+  if (!delta.state || delta.state.current !== 'complete') return;
+  for (const entry of __flowDownloadWatchers.values()) {
+    if (entry.downloadId !== delta.id || entry.resolved) continue;
+    entry.resolved = true;
+    entry.resolvedAt = Date.now();
+    try {
+      const items = await ext.downloads.search({ id: delta.id });
+      const item = items && items[0];
+      const url = item && (item.finalUrl || item.url);
+      if (!url) throw new Error('Could not determine the downloaded file\'s URL');
+      entry.result = await fetchImageAsBase64(url);
+    } catch (e) {
+      entry.result = { success: false, error: e.message };
+    } finally {
+      await removeDownload(delta.id, 'captured');
+    }
+    break;
+  }
+});
+
+// Watchers are kept around for a grace period after resolving (so the
+// dedupe check above can still see them) and only cleaned up after that.
+function scheduleFlowWatchCleanup(watchId) {
+  setTimeout(() => { __flowDownloadWatchers.delete(watchId); }, FLOW_DOWNLOAD_DEDUPE_GRACE_MS + 500);
+}
+
+
+
+async function waitForFlowDownloadResult(watchId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < (timeoutMs || 15000)) {
+    const entry = __flowDownloadWatchers.get(watchId);
+    if (!entry) return { success: false, error: 'download watch not found (expired?)' };
+    if (entry.resolved && entry.result) {
+      scheduleFlowWatchCleanup(watchId);
+      return entry.result;
+    }
+    await sleep(150);
+  }
+  scheduleFlowWatchCleanup(watchId);
+  return { success: false, error: 'timed out waiting for the 2K download to complete' };
 }
 
 function notifyPopup(action, data) {

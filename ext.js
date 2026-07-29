@@ -62,7 +62,11 @@
     downloads: chromeApi.downloads
       ? {
           onChanged: chromeApi.downloads.onChanged,
-          download: (...args) => chromeCall(chromeApi.downloads.download, chromeApi.downloads, args)
+          onCreated: chromeApi.downloads.onCreated,
+          download: (...args) => chromeCall(chromeApi.downloads.download, chromeApi.downloads, args),
+          search: (...args) => chromeCall(chromeApi.downloads.search, chromeApi.downloads, args),
+          removeFile: (...args) => chromeCall(chromeApi.downloads.removeFile, chromeApi.downloads, args),
+          erase: (...args) => chromeCall(chromeApi.downloads.erase, chromeApi.downloads, args)
         }
       : undefined
   };

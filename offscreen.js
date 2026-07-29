@@ -70,9 +70,13 @@
             await applyWatermark(finalCtx, finalCanvas.width, finalCanvas.height, watermark);
         }
 
-        // ── Step 5: Final Export ──────────────────────────────────────────────────
-        // Export at 100% quality to preserve the high-frequency GPU noise and subpixel variations
-        const outputBlob = await finalCanvas.convertToBlob({ type: 'image/jpeg', quality: 1.0 });
+        // ── Step 5: Final Export (requested format, compressed to fit maxSizeKB) ──
+        const outFileType = normalizeFileType(msg.fileType) || 'image/jpeg';
+        const maxSizeKB = (msg.maxSizeKB !== null && msg.maxSizeKB !== undefined && msg.maxSizeKB !== '' && isFinite(parseFloat(msg.maxSizeKB)) && parseFloat(msg.maxSizeKB) > 0)
+            ? parseFloat(msg.maxSizeKB) : null;
+
+        const { blob: outputBlob, canvas: outCanvas, quality: outQuality } =
+            await encodeToTargetSize(finalCanvas, outFileType, maxSizeKB);
 
         // Convert back to data URL for transport to background script
         const outputDataUrl = await blobToDataUrl(outputBlob);
@@ -80,11 +84,94 @@
         return {
             success: true,
             dataUrl: outputDataUrl,
-            width: finalCanvas.width,
-            height: finalCanvas.height,
-            mimeType: 'image/jpeg',
+            width: outCanvas.width,
+            height: outCanvas.height,
+            mimeType: outFileType,
+            quality: outQuality,
             size: outputBlob.size
         };
+    }
+
+    // ── Utility: map a user-facing file type ("PNG", "jpeg", "image/webp"...) ──
+    // to a canvas-encodable mime type.
+    function normalizeFileType(v) {
+        if (!v) return null;
+        const s = String(v).trim().toLowerCase().replace(/^image\//, '');
+        if (s === 'jpg' || s === 'jpeg') return 'image/jpeg';
+        if (s === 'png') return 'image/png';
+        if (s === 'webp') return 'image/webp';
+        return null;
+    }
+
+    /**
+     * Encode a canvas to the requested mime type, compressed to fit under
+     * maxSizeKB if given (null/0 = no size limit, just encode at best quality).
+     *
+     * - JPEG/WebP support a quality knob: binary-search it down to the largest
+     *   quality that still fits the target size.
+     * - PNG is lossless (no quality knob) — if it doesn't fit, and for
+     *   JPEG/WebP that still don't fit even at the lowest quality, the image
+     *   is progressively downscaled and re-encoded until it fits.
+     *
+     * @returns {Promise<{ blob: Blob, canvas: OffscreenCanvas, quality?: number }>}
+     */
+    async function encodeToTargetSize(sourceCanvas, mimeType, maxSizeKB) {
+        const supportsQuality = mimeType === 'image/jpeg' || mimeType === 'image/webp';
+        const maxBytes = maxSizeKB ? Math.floor(maxSizeKB * 1024) : null;
+
+        // No size limit requested — encode once, at full quality, and done.
+        if (!maxBytes) {
+            const blob = supportsQuality
+                ? await sourceCanvas.convertToBlob({ type: mimeType, quality: 1.0 })
+                : await sourceCanvas.convertToBlob({ type: mimeType });
+            return { blob, canvas: sourceCanvas, quality: supportsQuality ? 1.0 : undefined };
+        }
+
+        let workCanvas = sourceCanvas;
+        let bestForThisSize = null;
+        let bestQuality = undefined;
+
+        for (let downscalePass = 0; downscalePass < 9; downscalePass++) {
+            if (supportsQuality) {
+                // Binary-search quality for the largest value that still fits.
+                let lo = 0.05, hi = 1.0;
+                for (let i = 0; i < 8; i++) {
+                    const mid = (lo + hi) / 2;
+                    const candidate = await workCanvas.convertToBlob({ type: mimeType, quality: mid });
+                    if (candidate.size <= maxBytes) {
+                        bestForThisSize = candidate;
+                        bestQuality = mid;
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if (!bestForThisSize) {
+                    // Doesn't fit even at the floor quality -- fall through to downscaling below.
+                    bestForThisSize = await workCanvas.convertToBlob({ type: mimeType, quality: 0.05 });
+                    bestQuality = 0.05;
+                }
+            } else {
+                // PNG: no quality knob, just encode as-is.
+                bestForThisSize = await workCanvas.convertToBlob({ type: mimeType });
+            }
+
+            if (bestForThisSize.size <= maxBytes) {
+                return { blob: bestForThisSize, canvas: workCanvas, quality: bestQuality };
+            }
+
+            // Still too big -- shrink the canvas ~15% and try again.
+            const newW = Math.max(1, Math.round(workCanvas.width * 0.85));
+            const newH = Math.max(1, Math.round(workCanvas.height * 0.85));
+            if (newW === workCanvas.width && newH === workCanvas.height) break; // can't shrink further
+            const scaledCanvas = new OffscreenCanvas(newW, newH);
+            scaledCanvas.getContext('2d').drawImage(workCanvas, 0, 0, newW, newH);
+            workCanvas = scaledCanvas;
+            bestForThisSize = null;
+        }
+
+        // Ran out of downscale passes -- return the smallest we managed to produce.
+        return { blob: bestForThisSize, canvas: workCanvas, quality: bestQuality };
     }
 
     // ── Watermark rendering ──────────────────────────────────────────────────

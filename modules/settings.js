@@ -47,6 +47,8 @@
 
             // --- Image Processing ---
             jpegQuality: 0.90,        // 0.80 | 0.85 | 0.90 | 0.95 | 1.00
+            outputFileType: 'jpeg',   // 'jpeg' | 'png' | 'webp' -- fallback when a record doesn't supply its own "filetype"
+            maxSizeKB: 0,             // 0 (or 'any') = unlimited -- fallback when a record doesn't supply its own "max_size"
             maxRetries: 5,           // per record, before marking as failed
             retryBaseMs: 2000,        // base delay for exponential backoff
             retryMaxMs: 60000,       // cap on backoff delay
