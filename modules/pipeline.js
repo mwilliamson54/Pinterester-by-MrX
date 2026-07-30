@@ -385,16 +385,25 @@
                         created_at: new Date().toISOString()
                     }
                 };
-                const embeddedBlob = await meta().embedMetadata(sourceBlob, metadataToEmbed, {
+                const embedResult = await meta().embedMetadata(sourceBlob, metadataToEmbed, {
                     width: processed.width,
                     height: processed.height
                 });
+                const embeddedBlob = embedResult.blob;
 
-                // Metadata embedding happens AFTER compression, so it can push
-                // a file that was right at the requested size cap over the
-                // top. The size limit is a hard requirement, so if embedding
-                // broke it, keep the compressed-but-unlabeled version instead.
-                if (processingCfg.requestedMaxSizeKB && embeddedBlob.size > processingCfg.requestedMaxSizeKB * 1024) {
+                if (!embedResult.embedded) {
+                    // Every layer under this fails soft (missing serializer,
+                    // unsupported dimensions, internal error) and hands back
+                    // the original blob rather than throwing -- so this is
+                    // the ONLY reliable signal that nothing was actually
+                    // written. Leaving metadataWritten false here is what
+                    // makes the output field trustworthy.
+                    log()?.warn(TAG, `Metadata was not embedded: ${embedResult.reason || 'unknown reason'}`);
+                } else if (processingCfg.requestedMaxSizeKB && embeddedBlob.size > processingCfg.requestedMaxSizeKB * 1024) {
+                    // Metadata embedding happens AFTER compression, so it can push
+                    // a file that was right at the requested size cap over the
+                    // top. The size limit is a hard requirement, so if embedding
+                    // broke it, keep the compressed-but-unlabeled version instead.
                     log()?.warn(TAG, `Metadata embedding pushed file over the ${processingCfg.requestedMaxSizeKB}KB cap (${Math.round(embeddedBlob.size / 1024)}KB) — keeping compressed image without metadata instead.`);
                 } else {
                     finalDataUrl = await blobToDataUrl(embeddedBlob);
@@ -445,6 +454,14 @@
         const processingTimeMs = Date.now() - processingStartMs;
         const totalTimeMs = Date.now() - startMs;
 
+        // Recompute the mime type from the ACTUAL final bytes (post metadata
+        // embedding, right before upload/hashing) rather than trusting
+        // processed.mimeType, which reflects the pre-Stage-5 compression
+        // output only -- reading that stale value here is why image_format
+        // in the output kept reporting a format that didn't match what was
+        // actually uploaded to Drive.
+        const outputMime = (finalDataUrl && finalDataUrl.match(/^data:([^;]+);/)?.[1]) || processed.mimeType || 'image/jpeg';
+
         const existingMeta = record._raw?.metadata || {};
         const newMeta = {
             ...existingMeta,
@@ -459,7 +476,7 @@
                 metadata_written: metadataWritten,
                 watermark: !!wm.enabled,
                 compression: processed.quality !== undefined ? processed.quality : settings.jpegQuality,
-                image_format: (processed.mimeType || 'image/jpeg').replace(/^image\//, ''),
+                image_format: outputMime.replace(/^image\//, ''),
                 requested_max_size_kb: processingCfg.requestedMaxSizeKB || null,
                 sha256: finalSha256,
                 processing_hash: processingHash

@@ -335,7 +335,7 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'flowArmDownloadWatch') {
     // Must be armed BEFORE the content script clicks "2K Upscaled", so this
     // responds synchronously with a watchId to click against.
-    const watchId = armFlowDownloadWatch();
+    const watchId = armFlowDownloadWatch(sender?.tab?.id);
     sendResponse({ success: true, watchId });
     return false;
   } else if (message.action === 'flowGetDownloadResult') {
@@ -1532,23 +1532,28 @@ async function fetchImageAsBase64(imageUrl) {
 // Downloads folder) -- unlike every other capture path in this extension,
 // which just reads an <img src>. So: arm this watcher BEFORE the content
 // script clicks "2K Upscaled", catch the download it triggers, re-fetch the
-// bytes ourselves (background can bypass CORS), then delete the on-disk copy
-// again so nothing is left cluttering the user's Downloads folder.
+// bytes ourselves, then delete the on-disk copy again so nothing is left
+// cluttering the user's Downloads folder.
 //
-// One click was observed to sometimes produce 2-3 real downloads (the
-// original click routine fired the button's handler more than once as a
-// belt-and-suspenders measure that's harmless for buttons with a disabled-
-// state lock, but not for a plain Download button -- see
-// forceSingleClickViaBackground in content.js, used for this click instead).
-// As a second line of defence, ANY extra download that starts while a watch
-// is active (or shortly after it resolves) is treated as a duplicate of the
-// same click and deleted too, so nothing is left behind either way.
-const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt }
+// Only downloads that plausibly came from Flow itself (matched against
+// FLOW_DOWNLOAD_DOMAIN_HINTS, below) are ever touched by this watcher. This
+// used to match ANY download that happened to start anywhere in the browser
+// while a watch was active -- which meant a user's own manual download,
+// started at the wrong moment, got silently deleted along with the real
+// duplicates. Scoping the match to Flow's own domain fixes that without
+// giving up duplicate detection for Flow's own downloads.
+const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt, tabId }
 const FLOW_DOWNLOAD_DEDUPE_GRACE_MS = 4000;
+const FLOW_DOWNLOAD_DOMAIN_HINTS = ['labs.google'];
 
-function armFlowDownloadWatch() {
+function isLikelyFlowDownload(item) {
+  const haystack = `${item.referrer || ''} ${item.url || ''} ${item.finalUrl || ''}`;
+  return FLOW_DOWNLOAD_DOMAIN_HINTS.some(hint => haystack.includes(hint));
+}
+
+function armFlowDownloadWatch(tabId) {
   const watchId = `w-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  __flowDownloadWatchers.set(watchId, { downloadId: null, resolved: false, result: null, resolvedAt: null });
+  __flowDownloadWatchers.set(watchId, { downloadId: null, resolved: false, result: null, resolvedAt: null, tabId });
   return watchId;
 }
 
@@ -1559,6 +1564,11 @@ async function removeDownload(id, reason) {
 }
 
 ext.downloads?.onCreated?.addListener(async (item) => {
+  // Leave anything that doesn't look like it came from Flow completely
+  // alone -- most importantly, this is what keeps the user's own manual
+  // downloads from ever being touched.
+  if (!isLikelyFlowDownload(item)) return;
+
   // Attach to the oldest still-unmatched watcher.
   for (const entry of __flowDownloadWatchers.values()) {
     if (!entry.downloadId && !entry.resolved) {
@@ -1568,7 +1578,9 @@ ext.downloads?.onCreated?.addListener(async (item) => {
     }
   }
   // Otherwise, if any watcher is still active or resolved very recently,
-  // this is almost certainly an extra download from the same click -- remove it.
+  // this is almost certainly an extra Flow download from the same click
+  // (a double-fired button handler, etc.) -- remove it. Still gated on
+  // isLikelyFlowDownload above, so this can never catch an unrelated download.
   const now = Date.now();
   for (const entry of __flowDownloadWatchers.values()) {
     if (!entry.resolved || (entry.resolvedAt && now - entry.resolvedAt < FLOW_DOWNLOAD_DEDUPE_GRACE_MS)) {
@@ -1589,7 +1601,28 @@ ext.downloads?.onChanged?.addListener(async (delta) => {
       const item = items && items[0];
       const url = item && (item.finalUrl || item.url);
       if (!url) throw new Error('Could not determine the downloaded file\'s URL');
-      entry.result = await fetchImageAsBase64(url);
+
+      // Flow's 2K download is (like most of its assets) served as a blob:
+      // object URL, which only resolves inside the tab/page that created it.
+      // A fetch() from the background service worker against a blob: URL
+      // always fails with "Failed to fetch" -- silently, every single time --
+      // which is why 2K capture was reliably failing and falling back to the
+      // 1K on-page preview. Fetch it from inside the originating tab first
+      // (same trick getImageAsBase64 already uses elsewhere in this
+      // extension for cross-origin/blob images), and only fall back to a
+      // background fetch if that's unavailable.
+      let result = null;
+      if (entry.tabId != null) {
+        try {
+          result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
+        } catch (e) {
+          result = null; // tab gone / no listener -- fall through to background fetch
+        }
+      }
+      if (!result || !result.success) {
+        result = await fetchImageAsBase64(url);
+      }
+      entry.result = result;
     } catch (e) {
       entry.result = { success: false, error: e.message };
     } finally {

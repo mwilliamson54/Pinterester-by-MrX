@@ -128,36 +128,66 @@
         }
 
         let workCanvas = sourceCanvas;
-        let bestForThisSize = null;
-        let bestQuality = undefined;
+        // Track the smallest candidate produced across ALL passes so there is
+        // always something valid to fall back to. Previously the loop reset
+        // its only reference to the just-encoded blob to null right before
+        // shrinking for the next pass, then exited the "for" loop after the
+        // final shrink without ever re-encoding at that smaller size —
+        // returning a null blob. That crashed processImage() outright (caught
+        // upstream as a failure), which silently skipped watermarking, format
+        // conversion, AND metadata for that image. PNG hit this constantly
+        // (no quality knob to fall back on, and the GPU noise pass makes PNG
+        // compress worse), which is why compression/watermark/format all
+        // looked "broken" specifically on non-JPEG/WebP output.
+        let smallestBlob = null;
+        let smallestQuality = undefined;
+        let smallestCanvas = workCanvas;
 
         for (let downscalePass = 0; downscalePass < 9; downscalePass++) {
+            let candidateBlob;
+            let candidateQuality;
+
             if (supportsQuality) {
                 // Binary-search quality for the largest value that still fits.
                 let lo = 0.05, hi = 1.0;
+                let fitBlob = null, fitQuality;
                 for (let i = 0; i < 8; i++) {
                     const mid = (lo + hi) / 2;
                     const candidate = await workCanvas.convertToBlob({ type: mimeType, quality: mid });
                     if (candidate.size <= maxBytes) {
-                        bestForThisSize = candidate;
-                        bestQuality = mid;
+                        fitBlob = candidate;
+                        fitQuality = mid;
                         lo = mid;
                     } else {
                         hi = mid;
                     }
                 }
-                if (!bestForThisSize) {
-                    // Doesn't fit even at the floor quality -- fall through to downscaling below.
-                    bestForThisSize = await workCanvas.convertToBlob({ type: mimeType, quality: 0.05 });
-                    bestQuality = 0.05;
+                if (fitBlob) {
+                    candidateBlob = fitBlob;
+                    candidateQuality = fitQuality;
+                } else {
+                    // Doesn't fit even at the floor quality -- still keep it as
+                    // this pass's candidate (may become the eventual fallback),
+                    // and fall through to downscaling below.
+                    candidateBlob = await workCanvas.convertToBlob({ type: mimeType, quality: 0.05 });
+                    candidateQuality = 0.05;
                 }
             } else {
                 // PNG: no quality knob, just encode as-is.
-                bestForThisSize = await workCanvas.convertToBlob({ type: mimeType });
+                candidateBlob = await workCanvas.convertToBlob({ type: mimeType });
             }
 
-            if (bestForThisSize.size <= maxBytes) {
-                return { blob: bestForThisSize, canvas: workCanvas, quality: bestQuality };
+            // Remember the smallest candidate seen so far, regardless of
+            // whether it fits -- guarantees a non-null result even if the
+            // target is never hit within the downscale budget.
+            if (!smallestBlob || candidateBlob.size < smallestBlob.size) {
+                smallestBlob = candidateBlob;
+                smallestQuality = candidateQuality;
+                smallestCanvas = workCanvas;
+            }
+
+            if (candidateBlob.size <= maxBytes) {
+                return { blob: candidateBlob, canvas: workCanvas, quality: candidateQuality };
             }
 
             // Still too big -- shrink the canvas ~15% and try again.
@@ -167,11 +197,13 @@
             const scaledCanvas = new OffscreenCanvas(newW, newH);
             scaledCanvas.getContext('2d').drawImage(workCanvas, 0, 0, newW, newH);
             workCanvas = scaledCanvas;
-            bestForThisSize = null;
         }
 
-        // Ran out of downscale passes -- return the smallest we managed to produce.
-        return { blob: bestForThisSize, canvas: workCanvas, quality: bestQuality };
+        // Ran out of downscale passes without hitting the target -- return the
+        // smallest candidate we ever actually produced (guaranteed non-null),
+        // rather than crashing the whole pipeline over an unreachable target.
+        console.warn(`BulkyGen: could not compress ${mimeType} under ${maxSizeKB}KB even after 9 downscale passes; returning the smallest result achieved (${Math.round(smallestBlob.size / 1024)}KB).`);
+        return { blob: smallestBlob, canvas: smallestCanvas, quality: smallestQuality };
     }
 
     // ── Watermark rendering ──────────────────────────────────────────────────
@@ -179,7 +211,7 @@
         const {
             text,
             logoUrl,
-            opacity = 0.3,
+            opacity = 1.0,
             position = 'bottom-right',
             rotation = 0,
             font = '24px sans-serif',
@@ -188,7 +220,8 @@
         } = opts;
 
         ctx.save();
-        ctx.globalAlpha = Math.max(0, Math.min(1, parseFloat(opacity) || 0.3));
+        const parsedOpacity = parseFloat(opacity);
+        ctx.globalAlpha = Math.max(0, Math.min(1, Number.isFinite(parsedOpacity) ? parsedOpacity : 1.0));
 
         // Calculate anchor position
         const { x, y, textAlign, textBaseline } = getAnchor(position, canvasW, canvasH, margin);

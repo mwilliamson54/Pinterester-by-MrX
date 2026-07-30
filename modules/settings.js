@@ -71,7 +71,7 @@
             watermarkEnabled: false,
             watermarkText: '',
             watermarkLogoUrl: '',
-            watermarkOpacity: 0.3,
+            watermarkOpacity: 1.0, // 0% transparency (fully opaque) by default
             watermarkPosition: 'bottom-right',
             watermarkRotation: 0,
             watermarkFont: '24px sans-serif',

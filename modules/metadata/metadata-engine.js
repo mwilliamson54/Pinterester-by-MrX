@@ -86,8 +86,17 @@
      * @param {Object} rawMetadata
      * @param {Object} [opts] - { width, height } (only needed for WebP, to synthesize its VP8X chunk)
      */
+    // Every serializer's embed() is contractually guaranteed to return the
+    // SAME blob reference it was given when it didn't (or couldn't) change
+    // anything, and to always construct a brand-new Blob when it actually
+    // wrote something. That reference-identity is used below as the single
+    // source of truth for whether metadata was really embedded -- instead of
+    // treating "no exception was thrown" as success, which is what silently
+    // caused metadata_written: true to be reported even when every serializer
+    // had bailed out internally (missing library, unsupported format, no
+    // dimensions for WebP, etc.) and handed the original blob straight back.
     async function processAndInject(imageBlob, rawMetadata, opts) {
-        if (!rawMetadata) return imageBlob;
+        if (!rawMetadata) return { blob: imageBlob, embedded: false, reason: 'no metadata supplied' };
 
         try {
             log()?.info(TAG, 'Starting metadata pipeline...');
@@ -99,7 +108,7 @@
             const mapper = globalThis.bulkygenMetadataMapper;
             if (!mapper) {
                 log()?.error(TAG, 'Metadata Mapper not found. Skipping metadata.');
-                return imageBlob;
+                return { blob: imageBlob, embedded: false, reason: 'metadata mapper module not loaded' };
             }
 
             const xmpDict = mapper.mapMetadata(metadata, 'xmp');
@@ -111,8 +120,13 @@
             // PNG/WebP use their own container-native chunk mechanisms.
             if (mimeType === 'image/png' || mimeType === 'image/webp') {
                 const result = await injectIntoContainerFormat(imageBlob, mimeType, xmpDict, exifDict, opts);
-                log()?.info(TAG, 'Metadata pipeline complete.');
-                return result;
+                const embedded = result !== imageBlob;
+                log()?.info(TAG, `Metadata pipeline complete (embedded=${embedded}).`);
+                return {
+                    blob: result,
+                    embedded,
+                    reason: embedded ? null : 'serializer returned the file unchanged (missing serializer module, unsupported dimensions, or nothing to embed)'
+                };
             }
 
             // ── JPEG path (unchanged) ────────────────────────────────────────
@@ -135,12 +149,17 @@
             // Verification logic would go here: parse the finalBlob and ensure strings are present.
             // For now, we trust the pipeline since we rely on external proven libs and native XML.
 
-            log()?.info(TAG, 'Metadata pipeline complete.');
-            return finalBlob;
+            const embedded = finalBlob !== imageBlob;
+            log()?.info(TAG, `Metadata pipeline complete (embedded=${embedded}).`);
+            return {
+                blob: finalBlob,
+                embedded,
+                reason: embedded ? null : 'no EXIF/XMP serializer produced a modified file (missing serializer module, empty metadata, or an internal embed failure)'
+            };
 
         } catch (e) {
             log()?.error(TAG, 'Metadata pipeline failed: ' + e.message);
-            return imageBlob;
+            return { blob: imageBlob, embedded: false, reason: e.message };
         }
     }
 

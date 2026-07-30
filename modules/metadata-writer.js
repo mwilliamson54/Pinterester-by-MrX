@@ -26,19 +26,23 @@
      * @param {Blob} imageBlob — input image blob
      * @param {Object} rawMetadata — structured metadata JSON from Supabase
      * @param {Object} [opts] — { width, height } (needed for WebP, to synthesize its VP8X chunk)
-     * @returns {Promise<Blob>} image blob with embedded metadata
+     * @returns {Promise<{blob: Blob, embedded: boolean, reason: string|null}>}
+     *   `embedded` is only true if metadata was ACTUALLY written -- callers
+     *   must use it (not "did this throw?") to decide whether to report
+     *   metadata_written: true, since every layer below this one fails soft
+     *   and hands back the original blob rather than throwing.
      */
     async function embedMetadata(imageBlob, rawMetadata, opts) {
         if (!globalThis.bulkygenMetadataEngine) {
             log()?.error(TAG, 'Metadata engine not loaded. Returning blob unchanged.');
-            return imageBlob;
+            return { blob: imageBlob, embedded: false, reason: 'metadata engine not loaded' };
         }
 
         try {
             return await globalThis.bulkygenMetadataEngine.processAndInject(imageBlob, rawMetadata, opts);
         } catch (e) {
             log()?.error(TAG, 'Failed to embed metadata: ' + e.message);
-            return imageBlob;
+            return { blob: imageBlob, embedded: false, reason: e.message };
         }
     }
 

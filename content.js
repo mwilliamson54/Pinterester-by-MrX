@@ -1444,6 +1444,30 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.action === 'fetchUrlAsBase64') {
+    // Runs inside the Flow tab so it can read blob: object URLs Flow created
+    // (only resolvable in the page that made them) and reuse the page's own
+    // cookies/CORS context -- the background service worker can't do either.
+    (async () => {
+      try {
+        const response = await fetch(message.url, { mode: 'cors', credentials: 'include' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        if (blob.size < 100) throw new Error('Response too small, likely failed');
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+          reader.readAsDataURL(blob);
+        });
+        sendResponse({ success: true, dataUrl });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true; // async response
+  }
+
   if (message.action === 'generateImage') {
     const __genItemId = message.itemId;
     const __pushResult = (result) => {
