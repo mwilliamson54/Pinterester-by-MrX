@@ -1,9 +1,37 @@
 // Marker so the side panel / background never double-inject this script.
 window.__BULKYGEN_CS_LOADED__ = true;
-// Stop re-evaluation before const/let redeclarations throw. ensureTabContentScript
-// treats this specific error as "already present" (success).
+
+// Everything below lives inside this IIFE so that re-injecting content.js
+// (manifest's declarative injection AND background's manual
+// chrome.scripting.executeScript injection both target this same file) can
+// never throw "Identifier 'x' has already been declared".
+//
+// That SyntaxError used to happen because top-level `const`/`let` bindings
+// (like `const ext` right below) live in the page's shared global lexical
+// environment, which persists across separate script injections into the
+// same document. The guard below (`__BULKYGEN_CS_FULLY_INIT__`) was meant to
+// stop a re-injected copy before it re-declared anything -- but `const`/`let`
+// redeclaration is a *parse-time* SyntaxError, thrown before a single
+// statement of the re-injected script runs, so the guard never got a chance
+// to fire. Wrapping the file in a function gives every injection its own
+// private scope: each copy's `const ext` is local to its own IIFE call, so
+// there is nothing to collide with, and the guard below now actually runs
+// and works as intended (a plain early `return` instead of a `throw`, since
+// there's no longer a real problem to report).
+//
+// This mattered beyond the console noise: a re-injection is exactly how the
+// extension recovers a dead/stale content script (e.g. after the service
+// worker restarts and the old message channel stops responding). When that
+// recovery attempt failed with a SyntaxError, the tab was left with only the
+// old, disconnected listener -- so the "fetchUrlAsBase64" message used to
+// pull the real Flow "2K Upscaled" download's bytes had nowhere to land.
+// That silent failure was falling through to a background-side fetch of a
+// blob: URL (which can never succeed outside the tab that created it), so
+// the 2K capture reported failure, the pipeline fell back to the 1K
+// on-page image, and the real 2K file was deleted anyway during cleanup.
+(function () {
 if (window.__BULKYGEN_CS_FULLY_INIT__) {
-  throw new Error('BULKYGEN_CS_ALREADY_INIT');
+  return;
 }
 window.__BULKYGEN_CS_FULLY_INIT__ = true;
 
@@ -4612,3 +4640,5 @@ function __onPageUnload() {
 }
 window.addEventListener('pagehide', __onPageUnload, { capture: true });
 window.addEventListener('beforeunload', __onPageUnload, { capture: true });
+
+})(); // end of IIFE wrapper -- keeps every injection's declarations private to itself

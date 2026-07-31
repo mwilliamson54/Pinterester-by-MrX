@@ -1616,7 +1616,21 @@ ext.downloads?.onChanged?.addListener(async (delta) => {
         try {
           result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
         } catch (e) {
-          result = null; // tab gone / no listener -- fall through to background fetch
+          result = null; // tab gone / no listener -- try a forced re-inject before giving up
+        }
+        if (!result || !result.success) {
+          // The tab-side listener didn't answer (e.g. it went stale after a
+          // service-worker restart). Force a fresh content-script injection
+          // and retry once -- this is the only path that can actually read a
+          // blob: URL, since it only resolves inside the page that created
+          // it. Worth one retry before falling through to the background
+          // fetch below, which is guaranteed to fail on a blob: URL.
+          try {
+            await ensureTabContentScript(entry.tabId, true);
+            result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
+          } catch (e) {
+            result = null;
+          }
         }
       }
       if (!result || !result.success) {

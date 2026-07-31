@@ -82,6 +82,7 @@
     let _stopFlag = false;   // set to true to halt after current record
     let _pollTimer = null;    // setTimeout handle for next poll
     let _forceRun = false;   // true when explicitly started via startPipeline message (bypasses autonomousMode check)
+    let _lastPollWasNetworkRetry = false; // true right after a quiet one-shot retry for a transient "Failed to fetch"
 
     // Registry: pendingResultId → { resolve, reject, timer }
     // Lets the pipeline await the pushed image result from the existing generation loop.
@@ -617,7 +618,8 @@
 
     // ── Autonomous poll loop ─────────────────────────────────────────────────────
 
-    async function _poll() {
+    async function _poll(isNetworkRetry) {
+        if (!isNetworkRetry) _lastPollWasNetworkRetry = false;
         if (_stopFlag) {
             _running = false;
             await stats()?.setStatus('idle');
@@ -677,6 +679,19 @@
             await _processWithRetry(record, settings);
 
         } catch (err) {
+            // "Failed to fetch" here is almost always transient -- most often the
+            // MV3 service worker being woken back up from idle right as this poll
+            // fired, before its network stack is actually ready, rather than a
+            // real Supabase/connectivity problem. Retrying once, quickly and
+            // quietly, avoids flipping the status to a scary "error" (and logging
+            // one) for what's normally gone on its own by the very next poll.
+            const isTransientNetworkError = /failed to fetch|networkerror|network error|load failed/i.test(err.message || '');
+            if (isTransientNetworkError && !_lastPollWasNetworkRetry) {
+                _lastPollWasNetworkRetry = true;
+                log()?.warn(TAG, `Poll cycle network hiccup, retrying once: ${err.message}`);
+                _pollTimer = setTimeout(() => _poll(true), 1000);
+                return;
+            }
             log()?.error(TAG, `Poll cycle error: ${err.message}`);
             await stats()?.setStatus('error');
             await stats()?.setLastError(err.message);
