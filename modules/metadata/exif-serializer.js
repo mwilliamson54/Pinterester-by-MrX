@@ -77,9 +77,23 @@
         try {
             const exifObj = buildExifObj(mappedExif);
             const exifBinaryString = piexif.dump(exifObj); // raw bytes, as a binary string
-            const bytes = new Uint8Array(exifBinaryString.length);
-            for (let i = 0; i < exifBinaryString.length; i++) {
-                bytes[i] = exifBinaryString.charCodeAt(i) & 0xFF;
+            // piexif.dump() always prepends the 6-byte JPEG APP1 header
+            // "Exif\x00\x00" to its output.  For JPEG that's correct (the
+            // APP1 marker expects it), but WebP's RIFF "EXIF" chunk and
+            // PNG's "eXIf" chunk both expect raw TIFF data starting with
+            // the byte-order mark (II or MM), NOT the APP1 wrapper.  Strip
+            // the prefix when present so the downstream container
+            // serializers receive clean TIFF bytes.
+            const EXIF_HEADER = 'Exif\x00\x00';
+            let startOffset = 0;
+            if (exifBinaryString.length > 6 &&
+                exifBinaryString.substring(0, 6) === EXIF_HEADER) {
+                startOffset = 6;
+            }
+            const length = exifBinaryString.length - startOffset;
+            const bytes = new Uint8Array(length);
+            for (let i = 0; i < length; i++) {
+                bytes[i] = exifBinaryString.charCodeAt(i + startOffset) & 0xFF;
             }
             return bytes;
         } catch (e) {

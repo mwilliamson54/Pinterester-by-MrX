@@ -2253,9 +2253,17 @@ async function findAndOpenFlow2KOption(img) {
 // "2K Upscaled", catches the real browser download it triggers, and returns
 // the bytes as a data URL -- or null on any failure, so the caller can fall
 // back to the standard on-page preview capture.
+
+// Timeout shared between arming the watcher and waiting on it, so the two
+// values can never drift apart -- background.js gives the watcher a little
+// extra runway past this same number before it's allowed to expire (see
+// armFlowDownloadWatch in background.js), so we never risk disqualifying a
+// watcher this content script is still actively polling.
+const FLOW_2K_CAPTURE_TIMEOUT_MS = 90000;
+
 async function captureFlow2KUpscaled(img) {
   try {
-    const armed = await ext.runtime.sendMessage({ action: 'flowArmDownloadWatch' });
+    const armed = await ext.runtime.sendMessage({ action: 'flowArmDownloadWatch', timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS });
     if (!armed || !armed.success) {
       console.log('BulkyGen Flow: 2K capture - could not arm the download watcher');
       return null;
@@ -2269,7 +2277,7 @@ async function captureFlow2KUpscaled(img) {
     const result = await ext.runtime.sendMessage({
       action: 'flowGetDownloadResult',
       watchId: armed.watchId,
-      timeoutMs: 15000
+      timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS
     });
 
     pressKey(document.body, 'Escape', {}); // close the menu again either way
@@ -2458,10 +2466,34 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
       }
     }
 
-    const beforeKeys = new Set(
-      collectResultElements().filter(el => el.tagName === 'IMG').map(elementKey)
-    );
+    // "Before" snapshot: capture both loaded image keys AND every
+    // data-tile-id in the DOM. Flow's virtualized grid removes/unloads
+    // <img> elements for tiles scrolled out of view, but keeps the tile
+    // wrapper with its stable data-tile-id attribute in the DOM. If we
+    // only snapshot loaded images, a scroll mid-generation causes old
+    // tiles to lazy-load and appear "new" — associating the wrong image
+    // with this prompt. Snapshotting tile IDs catches those tiles even
+    // when their <img> hasn't loaded yet.
+    const beforeKeys = new Set();
+    const beforeTileIds = new Set();
+    collectResultElements()
+      .filter(el => {
+        if (el.tagName !== 'IMG') return false;
+        const src = el.currentSrc || el.src || '';
+        if (!src || !el.complete) return false;
+        const w = el.naturalWidth || el.width || 0;
+        const h = el.naturalHeight || el.height || 0;
+        return w >= 256 && h >= 256;
+      })
+      .forEach(el => beforeKeys.add(elementKey(el)));
     for (const k of __capturedResultKeys) beforeKeys.add(k);
+    // Snapshot ALL tile IDs in the DOM — even tiles whose images haven't
+    // loaded yet (scrolled out of view, placeholder state, etc.). This is
+    // the primary defense against scroll-induced lazy-load false positives.
+    document.querySelectorAll('[data-tile-id]').forEach(tile => {
+      const id = tile.getAttribute('data-tile-id');
+      if (id) beforeTileIds.add(id);
+    });
 
     editor.scrollIntoView({ behavior: 'instant', block: 'center' });
     await waitUnthrottled(150);
@@ -2491,7 +2523,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
     try {
       const expected = getFlowExpectedCount();
       console.log('BulkyGen Flow: expecting up to ' + expected + ' image(s)');
-      const resultImgs = await waitForFlowResults(beforeKeys, expected, 120000);
+      const resultImgs = await waitForFlowResults(beforeKeys, beforeTileIds, expected, 120000);
       console.log('BulkyGen Flow: detected ' + resultImgs.length + ' new image(s)');
       for (const img of resultImgs) {
         const src = img.currentSrc || img.src || '';
@@ -3004,7 +3036,10 @@ function isFlowGenerating() {
 
 // Wait for and collect ALL newly generated images (Flow x2 / x4 produce several).
 // Returns an array of <img> elements that were not present before submitting.
-async function waitForFlowResults(beforeKeys, expectedCount = 1, timeoutMs = 120000) {
+// beforeTileIds: Set of data-tile-id values snapshotted before generation —
+// any image inside a tile whose ID is in this set is an old image that
+// lazy-loaded after a scroll, NOT a new generation result.
+async function waitForFlowResults(beforeKeys, beforeTileIds, expectedCount = 1, timeoutMs = 120000) {
   const start = Date.now();
   const found = new Map(); // key -> img element
   let lastChangeAt = Date.now();
@@ -3017,24 +3052,47 @@ async function waitForFlowResults(beforeKeys, expectedCount = 1, timeoutMs = 120
   const STRAGGLER_GIVEUP_MS = 20000;
 
   while (Date.now() - start < timeoutMs) {
-    const imgs = collectResultElements().filter(el => el.tagName === 'IMG');
-    for (const img of imgs) {
-      const src = img.currentSrc || img.src || '';
-      if (!src) continue;
-      // Only count images that have actually finished decoding.
-      if (!img.complete) continue;
-      const w = img.naturalWidth || img.width || 0;
-      const h = img.naturalHeight || img.height || 0;
-      if (w < 256 || h < 256) continue;
-      const key = elementKey(img);
-      if (beforeKeys.has(key)) continue;
-      if (__capturedResultSrcs.has(src) || __capturedResultKeys.has(key)) continue;
-      if (!found.has(key)) {
-        found.set(key, img);
-        lastChangeAt = Date.now();
-        console.log('BulkyGen Flow: new image ' + found.size + '/' + expectedCount + ' (' + w + 'x' + h + ')');
-      } else {
-        found.set(key, img); // refresh element reference
+    // Hard cap: never accept more "new" images than this prompt actually
+    // asked Flow to generate. This is a deliberate backstop independent of
+    // whatever detection logic runs below -- if beforeKeys ever
+    // under-counts what already existed (for any reason, including ones we
+    // haven't seen yet), this is what stops it from snowballing into
+    // capturing the user's entire project instead of just this prompt's
+    // result(s).
+    if (found.size < expectedCount) {
+      const imgs = collectResultElements().filter(el => el.tagName === 'IMG');
+      for (const img of imgs) {
+        if (found.size >= expectedCount) break;
+        const src = img.currentSrc || img.src || '';
+        if (!src) continue;
+        // Only count images that have actually finished decoding.
+        if (!img.complete) continue;
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
+        if (w < 256 || h < 256) continue;
+        const key = elementKey(img);
+        if (beforeKeys.has(key)) continue;
+        if (__capturedResultSrcs.has(src) || __capturedResultKeys.has(key)) continue;
+        // ── Tile-ID guard (scroll-induced lazy-load defense) ──
+        // Flow's virtualized grid may lazy-load the <img> inside an old
+        // tile after the user scrolls, making it look "new" by src/key
+        // alone. The tile container's data-tile-id is stable regardless
+        // of load state, so if it was present before generation started
+        // this image is definitively old — skip it.
+        if (beforeTileIds && beforeTileIds.size > 0) {
+          const tileContainer = img.closest('[data-tile-id]');
+          if (tileContainer) {
+            const tileId = tileContainer.getAttribute('data-tile-id');
+            if (tileId && beforeTileIds.has(tileId)) continue;
+          }
+        }
+        if (!found.has(key)) {
+          found.set(key, img);
+          lastChangeAt = Date.now();
+          console.log('BulkyGen Flow: new image ' + found.size + '/' + expectedCount + ' (' + w + 'x' + h + ')');
+        } else {
+          found.set(key, img); // refresh element reference
+        }
       }
     }
 

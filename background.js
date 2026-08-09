@@ -334,8 +334,11 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   } else if (message.action === 'flowArmDownloadWatch') {
     // Must be armed BEFORE the content script clicks "2K Upscaled", so this
-    // responds synchronously with a watchId to click against.
-    const watchId = armFlowDownloadWatch(sender?.tab?.id);
+    // responds synchronously with a watchId to click against. timeoutMs is
+    // passed through so the watcher's own eligibility window (see
+    // armFlowDownloadWatch) matches how long the content script will
+    // actually wait -- see the comment there for why that matters.
+    const watchId = armFlowDownloadWatch(sender?.tab?.id, message.timeoutMs);
     sendResponse({ success: true, watchId });
     return false;
   } else if (message.action === 'flowGetDownloadResult') {
@@ -1542,18 +1545,33 @@ async function fetchImageAsBase64(imageUrl) {
 // started at the wrong moment, got silently deleted along with the real
 // duplicates. Scoping the match to Flow's own domain fixes that without
 // giving up duplicate detection for Flow's own downloads.
-const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt, tabId }
+const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt, tabId, expiresAt }
 const FLOW_DOWNLOAD_DEDUPE_GRACE_MS = 4000;
 const FLOW_DOWNLOAD_DOMAIN_HINTS = ['labs.google'];
+const FLOW_2K_DEFAULT_TIMEOUT_MS = 90000;
 
 function isLikelyFlowDownload(item) {
   const haystack = `${item.referrer || ''} ${item.url || ''} ${item.finalUrl || ''}`;
   return FLOW_DOWNLOAD_DOMAIN_HINTS.some(hint => haystack.includes(hint));
 }
 
-function armFlowDownloadWatch(tabId) {
+// timeoutMs should match whatever the content script will pass to
+// flowGetDownloadResult for this same watchId -- it defines the window
+// during which this watcher is allowed to claim an incoming download (see
+// expiresAt, and the onCreated listener below). A couple of seconds of
+// buffer are added on top so we never cut a watcher off while its owner is
+// still actively polling for it.
+function armFlowDownloadWatch(tabId, timeoutMs) {
   const watchId = `w-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  __flowDownloadWatchers.set(watchId, { downloadId: null, resolved: false, result: null, resolvedAt: null, tabId });
+  const ttl = Math.max(1000, Number(timeoutMs) || FLOW_2K_DEFAULT_TIMEOUT_MS);
+  __flowDownloadWatchers.set(watchId, {
+    downloadId: null,
+    resolved: false,
+    result: null,
+    resolvedAt: null,
+    tabId,
+    expiresAt: Date.now() + ttl + 2000
+  });
   return watchId;
 }
 
@@ -1568,22 +1586,50 @@ ext.downloads?.onCreated?.addListener(async (item) => {
   // alone -- most importantly, this is what keeps the user's own manual
   // downloads from ever being touched.
   if (!isLikelyFlowDownload(item)) return;
+  const now = Date.now();
 
-  // Attach to the oldest still-unmatched watcher.
+  // Attach to the oldest still-ELIGIBLE watcher -- one whose own deadline
+  // (expiresAt) hasn't passed yet.
+  //
+  // This expiresAt check is the actual fix for "2K Upscaled click works,
+  // but the extension processes the 1X image instead": previously this
+  // matched the oldest watcher with no downloadId yet, full stop -- with no
+  // concept of a watcher going stale. If any single 2K capture attempt
+  // failed to have a download attach to it in time (Flow's upscale running
+  // long, a slow hover/menu step eating into the budget, etc.), its watcher
+  // sat in this map forever "unmatched", waiting for a download that was
+  // never coming. The NEXT tile's capture would arm a fresh watcher, but
+  // this loop -- iterating the Map in insertion order -- would still find
+  // the old, abandoned watcher FIRST and hand it the next tile's real 2K
+  // download. That download would get correctly fetched... into a watcher
+  // nobody was listening to anymore (its own caller had already timed out
+  // and fallen back to the 1K preview), while the CURRENT tile's watcher
+  // never got its downloadId set, timed out in turn, and became the next
+  // abandoned watcher to steal the tile after it. One bad capture would
+  // silently cascade into every capture for the rest of the run always
+  // resolving to the 1K fallback, even though each 2K click was executing
+  // and downloading correctly.
   for (const entry of __flowDownloadWatchers.values()) {
-    if (!entry.downloadId && !entry.resolved) {
+    if (!entry.downloadId && !entry.resolved && now < entry.expiresAt) {
       entry.downloadId = item.id;
       console.log('BulkyGen Flow: 2K download started, id=' + item.id + ' file=' + item.filename);
       return;
     }
   }
-  // Otherwise, if any watcher is still active or resolved very recently,
-  // this is almost certainly an extra Flow download from the same click
-  // (a double-fired button handler, etc.) -- remove it. Still gated on
-  // isLikelyFlowDownload above, so this can never catch an unrelated download.
-  const now = Date.now();
+
+  // Otherwise, only treat this as an extra duplicate fire of a watcher that
+  // is still genuinely relevant right now (still within its own window, or
+  // resolved moments ago) -- never a watcher that's simply sitting around
+  // unclaimed after its owner already gave up on it. Erasing a download
+  // nothing is actually waiting on is worse than leaving it alone: at worst
+  // an unmatched Flow download (most likely the user's own manual one,
+  // since isLikelyFlowDownload already filtered to Flow's domain) is left
+  // for the user to deal with themselves, instead of us deleting a file
+  // they wanted.
   for (const entry of __flowDownloadWatchers.values()) {
-    if (!entry.resolved || (entry.resolvedAt && now - entry.resolvedAt < FLOW_DOWNLOAD_DEDUPE_GRACE_MS)) {
+    const stillActive = !entry.resolved && now < entry.expiresAt;
+    const justResolved = entry.resolved && entry.resolvedAt && (now - entry.resolvedAt < FLOW_DOWNLOAD_DEDUPE_GRACE_MS);
+    if (stillActive || justResolved) {
       await removeDownload(item.id, 'duplicate');
       return;
     }
@@ -1656,7 +1702,7 @@ function scheduleFlowWatchCleanup(watchId) {
 
 async function waitForFlowDownloadResult(watchId, timeoutMs) {
   const start = Date.now();
-  while (Date.now() - start < (timeoutMs || 15000)) {
+  while (Date.now() - start < (timeoutMs || FLOW_2K_DEFAULT_TIMEOUT_MS)) {
     const entry = __flowDownloadWatchers.get(watchId);
     if (!entry) return { success: false, error: 'download watch not found (expired?)' };
     if (entry.resolved && entry.result) {
