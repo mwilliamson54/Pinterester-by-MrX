@@ -53,6 +53,9 @@ function abortGenerationLoop(reason) {
   loopActive = false;
   loopActiveSince = null;
   markLoopProgress('aborted');
+  // A capture watcher is ownership for exactly one imminent Flow download.
+  // Never carry that ownership into a later run after an abort.
+  try { cancelAllFlowDownloadWatches(`generation aborted: ${msg}`); } catch (e) { /* ignore */ }
   try { ext.storage.local.set({ isRunning: false, isPaused: false }).catch(() => { }); } catch (e) { /* ignore */ }
   if (currentTabId != null) {
     try { ext.tabs.sendMessage(currentTabId, { action: 'bgKeepAlive', on: false }).catch(() => { }); } catch (e) { /* ignore */ }
@@ -95,6 +98,8 @@ function tryStartGeneration(resumeTabId) {
     isRunning = false;
     loopActive = false;
     loopActiveSince = null;
+    // Recovery starts a distinct run; no unclaimed watcher may survive it.
+    try { cancelAllFlowDownloadWatches('generation loop recovered'); } catch (e) { /* ignore */ }
     markLoopProgress('recovered');
   }
   startGeneration(resumeTabId).catch((e) => {
@@ -246,6 +251,7 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     loopActive = false;
     loopActiveSince = null;
     markLoopProgress('stopped');
+    try { cancelAllFlowDownloadWatches('generation stopped'); } catch (e) { /* ignore */ }
     ext.storage.local.set({ isPaused: false, isRunning: false }).catch(() => { });
     stopSwKeepAlive();
     disarmKeepAliveAlarm();
@@ -333,13 +339,17 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   } else if (message.action === 'flowArmDownloadWatch') {
-    // Must be armed BEFORE the content script clicks "2K Upscaled", so this
-    // responds synchronously with a watchId to click against. timeoutMs is
-    // passed through so the watcher's own eligibility window (see
-    // armFlowDownloadWatch) matches how long the content script will
-    // actually wait -- see the comment there for why that matters.
-    const watchId = armFlowDownloadWatch(sender?.tab?.id, message.timeoutMs);
-    sendResponse({ success: true, watchId });
+    // The content script opens and validates the exact tile menu first, then
+    // arms this single-use lease immediately before its one 2K click.
+    const armed = armFlowDownloadWatch(sender?.tab?.id, message.timeoutMs, {
+      tileId: message.tileId,
+      sourceKey: message.sourceKey
+    });
+    sendResponse(armed);
+    return false;
+  } else if (message.action === 'flowCancelDownloadWatch') {
+    const cancelled = cancelFlowDownloadWatch(message.watchId, message.reason || 'cancelled by Flow content script');
+    sendResponse({ success: cancelled });
     return false;
   } else if (message.action === 'flowGetDownloadResult') {
     waitForFlowDownloadResult(message.watchId, message.timeoutMs).then(result => {
@@ -1545,34 +1555,97 @@ async function fetchImageAsBase64(imageUrl) {
 // started at the wrong moment, got silently deleted along with the real
 // duplicates. Scoping the match to Flow's own domain fixes that without
 // giving up duplicate detection for Flow's own downloads.
-const __flowDownloadWatchers = new Map(); // watchId -> { downloadId, resolved, result, resolvedAt, tabId, expiresAt }
+// A watcher is an exclusive ownership lease for exactly one browser download.
+// DownloadItem does not expose the originating DOM tile, so allowing several
+// pending watches and assigning a download to the oldest one is inherently
+// unsafe. The content script serializes tile capture; enforce that invariant
+// here as well and reject ambiguity rather than downloading the wrong image.
+const __flowDownloadWatchers = new Map(); // watchId -> { state, downloadId, result, tabId, tileId, sourceKey, armedAt, expiresAt, cleanupTimer }
 const FLOW_DOWNLOAD_DEDUPE_GRACE_MS = 4000;
 const FLOW_DOWNLOAD_DOMAIN_HINTS = ['labs.google'];
 const FLOW_2K_DEFAULT_TIMEOUT_MS = 90000;
+const FLOW_2K_MIN_LONG_EDGE = 1800;
 
 function isLikelyFlowDownload(item) {
   const haystack = `${item.referrer || ''} ${item.url || ''} ${item.finalUrl || ''}`;
   return FLOW_DOWNLOAD_DOMAIN_HINTS.some(hint => haystack.includes(hint));
 }
 
-// timeoutMs should match whatever the content script will pass to
-// flowGetDownloadResult for this same watchId -- it defines the window
-// during which this watcher is allowed to claim an incoming download (see
-// expiresAt, and the onCreated listener below). A couple of seconds of
-// buffer are added on top so we never cut a watcher off while its owner is
-// still actively polling for it.
-function armFlowDownloadWatch(tabId, timeoutMs) {
-  const watchId = `w-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function isLiveFlowDownloadWatch(entry, now = Date.now()) {
+  return !!entry && (entry.state === 'armed' || entry.state === 'claimed' || entry.state === 'fetching') && now < entry.expiresAt;
+}
+
+function getLiveFlowDownloadWatches(now = Date.now()) {
+  return Array.from(__flowDownloadWatchers.values()).filter(entry => isLiveFlowDownloadWatch(entry, now));
+}
+
+function scheduleFlowWatchCleanup(watchId, delayMs = FLOW_DOWNLOAD_DEDUPE_GRACE_MS + 500) {
+  const entry = __flowDownloadWatchers.get(watchId);
+  if (!entry) return;
+  if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+  entry.cleanupTimer = setTimeout(() => {
+    const current = __flowDownloadWatchers.get(watchId);
+    if (current?.cleanupTimer) clearTimeout(current.cleanupTimer);
+    if (current?.expiryTimer) clearTimeout(current.expiryTimer);
+    __flowDownloadWatchers.delete(watchId);
+  }, Math.max(0, delayMs));
+}
+
+function cancelFlowDownloadWatch(watchId, reason) {
+  const entry = __flowDownloadWatchers.get(watchId);
+  if (!entry) return false;
+  // A completed result is immutable; all other states must immediately give up
+  // ownership so a later tile cannot be contaminated by this attempt.
+  if (entry.state !== 'completed') {
+    entry.state = 'cancelled';
+    entry.resolved = true;
+    entry.resolvedAt = Date.now();
+    entry.result = { success: false, error: reason || '2K download watch cancelled' };
+  }
+  scheduleFlowWatchCleanup(watchId, 0);
+  return true;
+}
+
+function cancelAllFlowDownloadWatches(reason) {
+  for (const watchId of Array.from(__flowDownloadWatchers.keys())) {
+    cancelFlowDownloadWatch(watchId, reason || 'all Flow download watches cancelled');
+  }
+}
+
+// Arm immediately before the verified 2K click. One global live watch is
+// intentional: Chrome's download events have no reliable DOM-tile identity,
+// so concurrent capture is an ambiguity that must fail closed.
+function armFlowDownloadWatch(tabId, timeoutMs, metadata = {}) {
+  const now = Date.now();
+  for (const [watchId, entry] of __flowDownloadWatchers) {
+    if (!isLiveFlowDownloadWatch(entry, now)) {
+      scheduleFlowWatchCleanup(watchId, 0);
+    }
+  }
+  const live = getLiveFlowDownloadWatches(now);
+  if (live.length) {
+    return { success: false, error: 'another Flow 2K capture is still active; refusing ambiguous download ownership' };
+  }
+
+  const watchId = `w-${now}-${Math.random().toString(16).slice(2)}`;
   const ttl = Math.max(1000, Number(timeoutMs) || FLOW_2K_DEFAULT_TIMEOUT_MS);
-  __flowDownloadWatchers.set(watchId, {
+  const entry = {
+    state: 'armed',
     downloadId: null,
     resolved: false,
     result: null,
     resolvedAt: null,
     tabId,
-    expiresAt: Date.now() + ttl + 2000
-  });
-  return watchId;
+    tileId: metadata.tileId || null,
+    sourceKey: metadata.sourceKey || null,
+    armedAt: now,
+    expiresAt: now + ttl
+  };
+  __flowDownloadWatchers.set(watchId, entry);
+  // If the content side disappears, release ownership at its deadline rather
+  // than leaving a stale watch for the next result.
+  entry.expiryTimer = setTimeout(() => cancelFlowDownloadWatch(watchId, '2K download watch expired'), ttl + 50);
+  return { success: true, watchId };
 }
 
 async function removeDownload(id, reason) {
@@ -1582,136 +1655,128 @@ async function removeDownload(id, reason) {
 }
 
 ext.downloads?.onCreated?.addListener(async (item) => {
-  // Leave anything that doesn't look like it came from Flow completely
-  // alone -- most importantly, this is what keeps the user's own manual
-  // downloads from ever being touched.
+  // Leave non-Flow downloads completely untouched.
   if (!isLikelyFlowDownload(item)) return;
   const now = Date.now();
+  const live = getLiveFlowDownloadWatches(now);
 
-  // Attach to the oldest still-ELIGIBLE watcher -- one whose own deadline
-  // (expiresAt) hasn't passed yet.
-  //
-  // This expiresAt check is the actual fix for "2K Upscaled click works,
-  // but the extension processes the 1X image instead": previously this
-  // matched the oldest watcher with no downloadId yet, full stop -- with no
-  // concept of a watcher going stale. If any single 2K capture attempt
-  // failed to have a download attach to it in time (Flow's upscale running
-  // long, a slow hover/menu step eating into the budget, etc.), its watcher
-  // sat in this map forever "unmatched", waiting for a download that was
-  // never coming. The NEXT tile's capture would arm a fresh watcher, but
-  // this loop -- iterating the Map in insertion order -- would still find
-  // the old, abandoned watcher FIRST and hand it the next tile's real 2K
-  // download. That download would get correctly fetched... into a watcher
-  // nobody was listening to anymore (its own caller had already timed out
-  // and fallen back to the 1K preview), while the CURRENT tile's watcher
-  // never got its downloadId set, timed out in turn, and became the next
-  // abandoned watcher to steal the tile after it. One bad capture would
-  // silently cascade into every capture for the rest of the run always
-  // resolving to the 1K fallback, even though each 2K click was executing
-  // and downloading correctly.
-  for (const entry of __flowDownloadWatchers.values()) {
-    if (!entry.downloadId && !entry.resolved && now < entry.expiresAt) {
-      entry.downloadId = item.id;
-      console.log('BulkyGen Flow: 2K download started, id=' + item.id + ' file=' + item.filename);
-      return;
-    }
+  // Exactly one currently armed watcher may claim a download. There is no
+  // "oldest pending" fallback: that is the race that assigned a later tile's
+  // 2K file to a failed earlier tile and forced the current tile to use 1K.
+  const candidate = live.length === 1 && live[0].state === 'armed' ? live[0] : null;
+  if (candidate) {
+    candidate.downloadId = item.id;
+    candidate.state = 'claimed';
+    candidate.downloadStartedAt = now;
+    console.log(`BulkyGen Flow: claimed 2K download id=${item.id} tile=${candidate.tileId || '?'} file=${item.filename}`);
+    return;
   }
 
-  // Otherwise, only treat this as an extra duplicate fire of a watcher that
-  // is still genuinely relevant right now (still within its own window, or
-  // resolved moments ago) -- never a watcher that's simply sitting around
-  // unclaimed after its owner already gave up on it. Erasing a download
-  // nothing is actually waiting on is worse than leaving it alone: at worst
-  // an unmatched Flow download (most likely the user's own manual one,
-  // since isLikelyFlowDownload already filtered to Flow's domain) is left
-  // for the user to deal with themselves, instead of us deleting a file
-  // they wanted.
-  for (const entry of __flowDownloadWatchers.values()) {
-    const stillActive = !entry.resolved && now < entry.expiresAt;
-    const justResolved = entry.resolved && entry.resolvedAt && (now - entry.resolvedAt < FLOW_DOWNLOAD_DEDUPE_GRACE_MS);
-    if (stillActive || justResolved) {
-      await removeDownload(item.id, 'duplicate');
-      return;
-    }
+  // A second download that starts while a capture is already claimed is an
+  // extra fire of the same action. Suppress that duplicate only while a live
+  // capture exists. If there is no live capture, leave the download alone so
+  // delayed/manual Flow downloads are never cancelled by stale extension state.
+  const activeCapture = live[0];
+  if (activeCapture && activeCapture.state !== 'armed') {
+    console.warn(`BulkyGen Flow: suppressing duplicate download id=${item.id}; active tile=${activeCapture.tileId || '?'}`);
+    await removeDownload(item.id, 'duplicate 2K action');
   }
 });
 
 ext.downloads?.onChanged?.addListener(async (delta) => {
-  if (!delta.state || delta.state.current !== 'complete') return;
-  for (const entry of __flowDownloadWatchers.values()) {
-    if (entry.downloadId !== delta.id || entry.resolved) continue;
+  if (!delta.state) return;
+  const entry = Array.from(__flowDownloadWatchers.values())
+    .find(candidate => candidate.downloadId === delta.id && candidate.state === 'claimed');
+  if (!entry) return;
+
+  if (delta.state.current === 'interrupted') {
+    entry.state = 'failed';
     entry.resolved = true;
     entry.resolvedAt = Date.now();
-    try {
-      const items = await ext.downloads.search({ id: delta.id });
-      const item = items && items[0];
-      const url = item && (item.finalUrl || item.url);
-      if (!url) throw new Error('Could not determine the downloaded file\'s URL');
+    entry.result = { success: false, error: `2K download was interrupted${delta.error?.current ? `: ${delta.error.current}` : ''}` };
+    console.warn(`BulkyGen Flow: claimed 2K download id=${delta.id} was interrupted`);
+    scheduleFlowWatchCleanup(Array.from(__flowDownloadWatchers.entries()).find(([, value]) => value === entry)?.[0]);
+    return;
+  }
+  if (delta.state.current !== 'complete') return;
 
-      // Flow's 2K download is (like most of its assets) served as a blob:
-      // object URL, which only resolves inside the tab/page that created it.
-      // A fetch() from the background service worker against a blob: URL
-      // always fails with "Failed to fetch" -- silently, every single time --
-      // which is why 2K capture was reliably failing and falling back to the
-      // 1K on-page preview. Fetch it from inside the originating tab first
-      // (same trick getImageAsBase64 already uses elsewhere in this
-      // extension for cross-origin/blob images), and only fall back to a
-      // background fetch if that's unavailable.
-      let result = null;
-      if (entry.tabId != null) {
-        try {
-          result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
-        } catch (e) {
-          result = null; // tab gone / no listener -- try a forced re-inject before giving up
-        }
-        if (!result || !result.success) {
-          // The tab-side listener didn't answer (e.g. it went stale after a
-          // service-worker restart). Force a fresh content-script injection
-          // and retry once -- this is the only path that can actually read a
-          // blob: URL, since it only resolves inside the page that created
-          // it. Worth one retry before falling through to the background
-          // fetch below, which is guaranteed to fail on a blob: URL.
-          try {
-            await ensureTabContentScript(entry.tabId, true);
-            result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
-          } catch (e) {
-            result = null;
-          }
-        }
+  entry.state = 'fetching';
+  try {
+    const items = await ext.downloads.search({ id: delta.id });
+    const item = items && items[0];
+    const url = item && (item.finalUrl || item.url);
+    if (!url) throw new Error('Could not determine the downloaded file\'s URL');
+
+    // Fetch blob URLs in their creator tab first; only that context can resolve
+    // Flow's object URL. The fallback still covers ordinary HTTPS assets.
+    let result = null;
+    if (entry.tabId != null) {
+      try {
+        result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
+      } catch (e) {
+        result = null;
       }
       if (!result || !result.success) {
-        result = await fetchImageAsBase64(url);
+        try {
+          await ensureTabContentScript(entry.tabId, true);
+          result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
+        } catch (e) {
+          result = null;
+        }
       }
-      entry.result = result;
-    } catch (e) {
-      entry.result = { success: false, error: e.message };
-    } finally {
-      await removeDownload(delta.id, 'captured');
     }
-    break;
+    if (!result || !result.success) result = await fetchImageAsBase64(url);
+
+    // A Flow-domain download alone is not proof that this is the requested 2K
+    // asset. Reject the observed bytes unless the decoded long edge is 2K.
+    if (result?.success && result.dataUrl && entry.tabId != null) {
+      const inspection = await ext.tabs.sendMessage(entry.tabId, {
+        action: 'inspectFlow2KDataUrl', dataUrl: result.dataUrl, minLongEdge: FLOW_2K_MIN_LONG_EDGE
+      });
+      if (!inspection?.success) {
+        result = {
+          success: false,
+          error: `download failed 2K verification for tile ${entry.tileId || '?'}: ${inspection?.error || 'could not confirm image dimensions'}`
+        };
+      } else {
+        result.width = inspection.width;
+        result.height = inspection.height;
+        result.resolution = '2K';
+      }
+    }
+
+    // A cancellation can race the in-tab fetch. Never resurrect a watch that
+    // has already relinquished ownership to the next attempt.
+    if (entry.state !== 'fetching') return;
+    entry.result = result || { success: false, error: '2K download returned no image data' };
+    entry.state = entry.result.success ? 'completed' : 'failed';
+    entry.resolved = true;
+    entry.resolvedAt = Date.now();
+  } catch (e) {
+    if (entry.state === 'fetching') {
+      entry.state = 'failed';
+      entry.resolved = true;
+      entry.resolvedAt = Date.now();
+      entry.result = { success: false, error: e.message };
+    }
+  } finally {
+    await removeDownload(delta.id, 'captured 2K candidate');
   }
 });
 
-// Watchers are kept around for a grace period after resolving (so the
-// dedupe check above can still see them) and only cleaned up after that.
-function scheduleFlowWatchCleanup(watchId) {
-  setTimeout(() => { __flowDownloadWatchers.delete(watchId); }, FLOW_DOWNLOAD_DEDUPE_GRACE_MS + 500);
-}
-
-
-
 async function waitForFlowDownloadResult(watchId, timeoutMs) {
   const start = Date.now();
-  while (Date.now() - start < (timeoutMs || FLOW_2K_DEFAULT_TIMEOUT_MS)) {
+  const limit = Math.max(1000, Number(timeoutMs) || FLOW_2K_DEFAULT_TIMEOUT_MS);
+  while (Date.now() - start < limit) {
     const entry = __flowDownloadWatchers.get(watchId);
-    if (!entry) return { success: false, error: 'download watch not found (expired?)' };
+    if (!entry) return { success: false, error: 'download watch not found or already cancelled' };
     if (entry.resolved && entry.result) {
       scheduleFlowWatchCleanup(watchId);
       return entry.result;
     }
     await sleep(150);
   }
-  scheduleFlowWatchCleanup(watchId);
+  cancelFlowDownloadWatch(watchId, 'timed out waiting for the 2K download to complete');
   return { success: false, error: 'timed out waiting for the 2K download to complete' };
 }
 

@@ -374,8 +374,8 @@
                         website: record.website || settings.metadataWebsite
                     },
                     generation: {
-                        software: 'BulkyGen Extension',
-                        generator: 'Flow Autonomous',
+                        software: '',
+                        generator: '1',
                         image_id: record.id,
                         prompt_id: record.id
                     },

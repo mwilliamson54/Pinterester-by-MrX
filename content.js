@@ -1496,6 +1496,38 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async response
   }
 
+  if (message.action === 'inspectFlow2KDataUrl') {
+    // This check runs in the page because the service worker has no Image DOM.
+    // It verifies the bytes caught from a browser download are actually an
+    // upscaled 2K asset before the background assigns them to a prompt.
+    (async () => {
+      try {
+        const dataUrl = message.dataUrl;
+        if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
+          throw new Error('Downloaded payload is not an image data URL');
+        }
+        const image = new Image();
+        const dimensions = await new Promise((resolve, reject) => {
+          image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+          image.onerror = () => reject(new Error('Browser could not decode downloaded image'));
+          image.src = dataUrl;
+        });
+        const longEdge = Math.max(dimensions.width || 0, dimensions.height || 0);
+        const minLongEdge = Number(message.minLongEdge) || 1800;
+        sendResponse({
+          success: longEdge >= minLongEdge,
+          width: dimensions.width,
+          height: dimensions.height,
+          longEdge,
+          error: longEdge >= minLongEdge ? null : `downloaded image is ${dimensions.width}x${dimensions.height}, below 2K threshold`
+        });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
   if (message.action === 'generateImage') {
     const __genItemId = message.itemId;
     const __pushResult = (result) => {
@@ -2087,6 +2119,75 @@ let __kaLingerTimer = null;
 // a generation is still running (e.g. Flow SPA navigates away mid-generation),
 // so the pipeline fails fast instead of waiting 300 seconds.
 let __activeGenerationItemId = null;
+
+// Flow virtualizes its project grid. Some old tiles are not in the DOM at a
+// prompt's initial snapshot and can appear only because the user scrolls while
+// a new generation is running. Keep a long-lived tile ledger from page load and
+// mark tiles mounted near a user scroll as untrusted for the active run. It is
+// safer to retry than to silently assign an earlier prompt's artwork.
+const __flowKnownTileIds = new Set();
+const __flowScrollMountedTileIds = new Map();
+let __flowTileTrackerInstalled = false;
+let __flowLastUserScrollAt = 0;
+const FLOW_SCROLL_GUARD_MS = 2500;
+
+function rememberFlowTileIds(root) {
+  if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+  const add = (tile) => {
+    const id = tile?.getAttribute?.('data-tile-id');
+    if (!id) return;
+    __flowKnownTileIds.add(id);
+    if (Date.now() - __flowLastUserScrollAt <= FLOW_SCROLL_GUARD_MS) {
+      __flowScrollMountedTileIds.set(id, Date.now());
+    }
+  };
+  if (root.matches?.('[data-tile-id]')) add(root);
+  root.querySelectorAll?.('[data-tile-id]').forEach(add);
+}
+
+function ensureFlowTileIdentityTracker() {
+  if (__flowTileTrackerInstalled || PROVIDER !== 'flow') return;
+  __flowTileTrackerInstalled = true;
+  document.querySelectorAll('[data-tile-id]').forEach(tile => {
+    const id = tile.getAttribute('data-tile-id');
+    if (id) __flowKnownTileIds.add(id);
+  });
+  window.addEventListener('scroll', () => { __flowLastUserScrollAt = Date.now(); }, true);
+  const observer = new MutationObserver(records => {
+    for (const record of records) {
+      record.addedNodes.forEach(node => rememberFlowTileIds(node));
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+function createFlowRunIdentity(beforeTileIds) {
+  ensureFlowTileIdentityTracker();
+  return {
+    beforeTileIds,
+    startedAt: Date.now(),
+    // Snapshot tiles known at the actual submission boundary as a second guard
+    // for tiles that were seen earlier but are currently virtualized away.
+    knownBeforeStart: new Set(__flowKnownTileIds)
+  };
+}
+
+function shouldRejectFlowTileForRun(tileId, identity) {
+  if (!tileId || !identity) return true; // Never accept an unbound image.
+  if (identity.beforeTileIds?.has(tileId)) return true;
+  if (identity.knownBeforeStart?.has(tileId)) return true;
+  const scrollMountedAt = __flowScrollMountedTileIds.get(tileId) || 0;
+  return scrollMountedAt >= identity.startedAt;
+}
+
+// Install immediately (not only when the first prompt is submitted) so scrolls
+// that occur while the queue is idle still contribute to the old-tile ledger.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', ensureFlowTileIdentityTracker, { once: true });
+} else {
+  ensureFlowTileIdentityTracker();
+}
+
 function ensureKeepAlive() {
   __kaRefs++;
   if (__kaLingerTimer) { clearTimeout(__kaLingerTimer); __kaLingerTimer = null; }
@@ -2134,7 +2235,13 @@ async function generateImage(prompt, itemId) {
 // Find the tile container for a given result image (Flow tags each result
 // tile with a stable data-tile-id attribute, unlike its buttons/menus).
 function findFlowTileContainer(img) {
-  return img.closest('[data-tile-id]') || img.parentElement;
+  // A generic parent is not a safe fallback: it can contain controls for a
+  // different tile when Flow virtualizes or reorders the project grid.
+  return img ? img.closest('[data-tile-id]') : null;
+}
+
+function getFlowTileId(img) {
+  return findFlowTileContainer(img)?.getAttribute('data-tile-id') || null;
 }
 
 // Find the tile's "More" (⋮ three-dot) button -- this is what you have to
@@ -2171,20 +2278,35 @@ function flowDispatchHover(el) {
 // Inside whichever menu is currently open, find the "Download" entry (it
 // itself opens a further submenu, aria-haspopup="menu" -- Flow nests the
 // 1K/2K Upscaled choices one level deeper, revealed on HOVER not click).
+function isVisibleEnabledFlowMenuAction(el) {
+  if (!el || !el.isConnected || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+  try {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+    return rect.width > 0 && rect.height > 0;
+  } catch {
+    return false;
+  }
+}
+
 function findFlowDownloadSubmenuTrigger() {
   const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
   for (const item of items) {
+    if (!isVisibleEnabledFlowMenuAction(item)) continue;
     if (item.getAttribute('aria-haspopup') !== 'menu') continue;
     if (normalizeText(item.textContent || '').startsWith('download')) return item;
   }
   return null;
 }
 
-// Find the "2K Upscaled" option itself, wherever it currently sits in the
-// DOM -- matched by text, not id/class, since Radix regenerates those ids.
+// Find the currently visible, enabled "2K Upscaled" menu item. A portal from
+// a prior menu can remain in the DOM briefly, so unscoped text matching is not
+// safe here: it can click an old tile's detached action after the page scrolls.
 function findFlow2KUpscaledButton() {
   const candidates = Array.from(document.querySelectorAll('button, [role="menuitem"]'));
   for (const el of candidates) {
+    if (!isVisibleEnabledFlowMenuAction(el)) continue;
     const text = normalizeText(el.textContent || '');
     if (text.includes('2k') && text.includes('upscal')) return el;
   }
@@ -2261,29 +2383,69 @@ async function findAndOpenFlow2KOption(img) {
 // watcher this content script is still actively polling.
 const FLOW_2K_CAPTURE_TIMEOUT_MS = 90000;
 
-async function captureFlow2KUpscaled(img) {
+async function cancelFlowDownloadWatch(watchId, reason) {
+  if (!watchId) return;
   try {
-    const armed = await ext.runtime.sendMessage({ action: 'flowArmDownloadWatch', timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS });
-    if (!armed || !armed.success) {
-      console.log('BulkyGen Flow: 2K capture - could not arm the download watcher');
+    await ext.runtime.sendMessage({ action: 'flowCancelDownloadWatch', watchId, reason });
+  } catch (e) {
+    // The background may have restarted. Its in-memory watcher is then already gone.
+  }
+}
+
+async function captureFlow2KUpscaled(img) {
+  let watchId = null;
+  let captured = false;
+  const tileId = getFlowTileId(img);
+  try {
+    // Do not create a live watcher until the exact 2K option for this tile is
+    // present. A watcher armed before menu discovery survives a failed hover or
+    // stale menu and can steal the next tile's download.
+    if (!tileId || !img.isConnected) {
+      console.log('BulkyGen Flow: 2K capture - source image is not in a stable tile');
       return null;
     }
-
     const button = await findAndOpenFlow2KOption(img);
     if (!button) return null;
 
-    await forceSingleClickViaBackground(button);
+    // The user may scroll while the menu is opening. Verify that our source
+    // still belongs to the same stable Flow tile before we create download
+    // ownership or execute the irreversible action.
+    if (!img.isConnected || getFlowTileId(img) !== tileId || !isVisibleEnabledFlowMenuAction(button)) {
+      console.log('BulkyGen Flow: 2K capture - tile/menu changed before click; refusing unbound download');
+      return null;
+    }
+
+    // Arm immediately before the one verified click. The background receives
+    // the tile/source identity for diagnostics and rejects overlapping watches
+    // in this tab rather than guessing by the oldest pending request.
+    const armed = await ext.runtime.sendMessage({
+      action: 'flowArmDownloadWatch',
+      timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS,
+      tileId,
+      sourceKey: elementKey(img)
+    });
+    if (!armed || !armed.success) {
+      console.log('BulkyGen Flow: 2K capture - could not arm the download watcher:', armed && armed.error);
+      return null;
+    }
+    watchId = armed.watchId;
+
+    const click = await forceSingleClickViaBackground(button);
+    const clickResult = click && (click.result || click);
+    if (!click || click.ok === false || !clickResult?.found || (!clickResult.calledOnClick && !clickResult.dispatched)) {
+      console.log('BulkyGen Flow: 2K capture - the selected 2K action was not clicked exactly once');
+      return null;
+    }
 
     const result = await ext.runtime.sendMessage({
       action: 'flowGetDownloadResult',
-      watchId: armed.watchId,
+      watchId,
       timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS
     });
 
-    pressKey(document.body, 'Escape', {}); // close the menu again either way
-
     if (result && result.success && result.dataUrl) {
-      console.log('BulkyGen Flow: 2K Upscaled captured successfully');
+      captured = true;
+      console.log('BulkyGen Flow: 2K Upscaled captured successfully for tile', tileId);
       return result.dataUrl;
     }
     console.log('BulkyGen Flow: 2K capture failed:', result && result.error);
@@ -2291,6 +2453,12 @@ async function captureFlow2KUpscaled(img) {
   } catch (e) {
     console.log('BulkyGen Flow: 2K capture threw:', e.message);
     return null;
+  } finally {
+    // Closing the menu is harmless. More importantly, a failed/aborted attempt
+    // must relinquish its watch synchronously; expiry-only cleanup lets stale
+    // watches claim downloads from a later image.
+    pressKey(document.body, 'Escape', {});
+    if (watchId && !captured) await cancelFlowDownloadWatch(watchId, '2K capture did not complete');
   }
 }
 
@@ -2494,6 +2662,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
       const id = tile.getAttribute('data-tile-id');
       if (id) beforeTileIds.add(id);
     });
+    const flowRunIdentity = createFlowRunIdentity(beforeTileIds);
 
     editor.scrollIntoView({ behavior: 'instant', block: 'center' });
     await waitUnthrottled(150);
@@ -2523,7 +2692,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
     try {
       const expected = getFlowExpectedCount();
       console.log('BulkyGen Flow: expecting up to ' + expected + ' image(s)');
-      const resultImgs = await waitForFlowResults(beforeKeys, beforeTileIds, expected, 120000);
+      const resultImgs = await waitForFlowResults(beforeKeys, flowRunIdentity, expected, 120000);
       console.log('BulkyGen Flow: detected ' + resultImgs.length + ' new image(s)');
       for (const img of resultImgs) {
         const src = img.currentSrc || img.src || '';
@@ -3036,10 +3205,10 @@ function isFlowGenerating() {
 
 // Wait for and collect ALL newly generated images (Flow x2 / x4 produce several).
 // Returns an array of <img> elements that were not present before submitting.
-// beforeTileIds: Set of data-tile-id values snapshotted before generation —
-// any image inside a tile whose ID is in this set is an old image that
-// lazy-loaded after a scroll, NOT a new generation result.
-async function waitForFlowResults(beforeKeys, beforeTileIds, expectedCount = 1, timeoutMs = 120000) {
+// flowRunIdentity tracks both tiles present at submission and tiles previously
+// observed by the page-wide ledger. This prevents a virtualized older tile from
+// becoming eligible merely because it mounts after the user scrolls.
+async function waitForFlowResults(beforeKeys, flowRunIdentity, expectedCount = 1, timeoutMs = 120000) {
   const start = Date.now();
   const found = new Map(); // key -> img element
   let lastChangeAt = Date.now();
@@ -3073,18 +3242,14 @@ async function waitForFlowResults(beforeKeys, beforeTileIds, expectedCount = 1, 
         const key = elementKey(img);
         if (beforeKeys.has(key)) continue;
         if (__capturedResultSrcs.has(src) || __capturedResultKeys.has(key)) continue;
-        // ── Tile-ID guard (scroll-induced lazy-load defense) ──
-        // Flow's virtualized grid may lazy-load the <img> inside an old
-        // tile after the user scrolls, making it look "new" by src/key
-        // alone. The tile container's data-tile-id is stable regardless
-        // of load state, so if it was present before generation started
-        // this image is definitively old — skip it.
-        if (beforeTileIds && beforeTileIds.size > 0) {
-          const tileContainer = img.closest('[data-tile-id]');
-          if (tileContainer) {
-            const tileId = tileContainer.getAttribute('data-tile-id');
-            if (tileId && beforeTileIds.has(tileId)) continue;
-          }
+        // ── Strict tile-identity guard (scroll/lazy-load defense) ──
+        // Every accepted Flow image must have a stable tile ID, and that ID
+        // must be newly created for THIS run. A candidate that is not bound to
+        // a tile, was already present, was seen in a prior viewport, or mounted
+        // immediately after a user scroll is rejected rather than guessed at.
+        const tileId = getFlowTileId(img);
+        if (shouldRejectFlowTileForRun(tileId, flowRunIdentity)) {
+          continue;
         }
         if (!found.has(key)) {
           found.set(key, img);
