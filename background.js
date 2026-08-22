@@ -1477,27 +1477,49 @@ function mainWorldSingleClick() {
 // Fetch cross-origin image as base64 (background script can bypass CORS)
 async function fetchImageAsBase64(imageUrl) {
   try {
-    // Try with credentials first (for authenticated resources like Grok videos)
-    let response = await fetch(imageUrl, {
-      mode: 'cors',
-      credentials: 'include'
-    });
+    // NOTE on the fallback chain below: credentials:'include' against a CDN
+    // that answers with a wildcard `Access-Control-Allow-Origin: *` (very
+    // common — S3/Wasabi/CloudFront/Facebook/Twitter CDNs, etc.) doesn't
+    // come back as an HTTP error response at all. The browser refuses it
+    // at the network layer and fetch() throws a bare
+    // "TypeError: Failed to fetch" with no status code to inspect. The old
+    // code only fell back to a credential-less retry when it saw
+    // response.status === 403, so in this (very common) failure mode the
+    // first fetch would throw before a response even existed, jump
+    // straight to the outer catch, and the 403-triggered fallback below it
+    // never ran. Each attempt is now wrapped individually so a thrown
+    // TypeError falls through to the next attempt exactly like a 403 does.
+    let response = null;
+    let lastError = null;
 
-    // If 403 with credentials, try without (some CDNs reject credentialed requests)
-    if (response.status === 403) {
-      console.log('Retrying fetch without credentials...');
-      response = await fetch(imageUrl, {
-        mode: 'cors',
-        credentials: 'omit'
-      });
+    // Attempt 1: credentialed CORS request (needed for auth-gated assets
+    // like Grok videos that actually require the session cookie).
+    try {
+      response = await fetch(imageUrl, { mode: 'cors', credentials: 'include' });
+    } catch (err) {
+      lastError = err;
+      response = null;
     }
 
-    // If still failing, try with no-cors (opaque response, but might work)
-    if (!response.ok && response.status === 403) {
-      console.log('Retrying with different headers...');
-      response = await fetch(imageUrl, {
-        mode: 'no-cors'
-      });
+    // Attempt 2: same request without credentials — this is the one that
+    // actually recovers most real-world CDN failures, whether attempt 1
+    // failed with a 403 response OR threw outright.
+    if (!response || (!response.ok && response.status === 403)) {
+      console.log('Retrying fetch without credentials...');
+      try {
+        response = await fetch(imageUrl, { mode: 'cors', credentials: 'omit' });
+        lastError = null;
+      } catch (err) {
+        lastError = err;
+        response = response || null;
+      }
+    }
+
+    if (!response) {
+      // Both attempts threw a network-level error — nothing to fall back
+      // to (no-cors mode returns an opaque, unreadable body, so it can't
+      // recover real image bytes and isn't worth attempting).
+      throw lastError || new Error('Failed to fetch image (network error)');
     }
 
     if (!response.ok) {

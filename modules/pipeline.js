@@ -83,6 +83,7 @@
     let _pollTimer = null;    // setTimeout handle for next poll
     let _forceRun = false;   // true when explicitly started via startPipeline message (bypasses autonomousMode check)
     let _lastPollWasNetworkRetry = false; // true right after a quiet one-shot retry for a transient "Failed to fetch"
+    let _consecutiveErrors = 0; // count of back-to-back poll failures, for backoff
 
     // Registry: pendingResultId → { resolve, reject, timer }
     // Lets the pipeline await the pushed image result from the existing generation loop.
@@ -659,6 +660,7 @@
             if (!rawRecord) {
                 // No pending records — wait for the configured poll interval
                 log()?.verbose(TAG, `No pending records — polling again in ${settings.pollIntervalMs}ms`);
+                _consecutiveErrors = 0;
                 await stats()?.setStatus('idle');
                 await stats()?.setQueueSize(0);
                 _pollTimer = setTimeout(_poll, settings.pollIntervalMs || 5000);
@@ -667,6 +669,7 @@
 
             const record = supa()?.normalizeRecord(rawRecord, settings);
             log()?.info(TAG, `Found pending record id=${record.id}: "${(record.prompt || '').slice(0, 60)}"`);
+            _consecutiveErrors = 0;
 
             // Fetch actual queue count for dashboard display
             try {
@@ -692,9 +695,27 @@
                 _pollTimer = setTimeout(() => _poll(true), 1000);
                 return;
             }
-            log()?.error(TAG, `Poll cycle error: ${err.message}`);
+
+            // Genuine, repeated failure (network still down, bad Supabase URL/key,
+            // project paused, etc.) -- NOT the quick one-shot case above. Back off
+            // exponentially instead of falling through to the 100ms "just processed
+            // a record, grab the next one" retry below: that shared fast-path used
+            // to catch this branch too, which meant a persistent outage retried
+            // every ~100ms forever, hammering the network and spamming this exact
+            // log line nonstop instead of settling into a slow, quiet retry.
+            _consecutiveErrors++;
+            const backoffMs = Math.min(30000, 1000 * Math.pow(2, Math.min(_consecutiveErrors - 1, 5)));
+            log()?.error(TAG, `Poll cycle error (${_consecutiveErrors} in a row): ${err.message} — retrying in ${backoffMs}ms`);
             await stats()?.setStatus('error');
             await stats()?.setLastError(err.message);
+            if (!_stopFlag) {
+                _pollTimer = setTimeout(_poll, backoffMs);
+            } else {
+                _running = false;
+                await stats()?.setStatus('idle');
+                log()?.info(TAG, 'Autonomous loop stopped');
+            }
+            return;
         }
 
         // Schedule next poll immediately if loop is still active

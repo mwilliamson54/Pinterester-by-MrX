@@ -223,6 +223,19 @@
         const parsedOpacity = parseFloat(opacity);
         ctx.globalAlpha = Math.max(0, Math.min(1, Number.isFinite(parsedOpacity) ? parsedOpacity : 1.0));
 
+        // ── 5th layout: "banner" ────────────────────────────────────────────
+        // A boxed website/credit line (white box, black border, black text)
+        // with black horizontal rules running from the box out toward the
+        // left/right edges. Totally different draw path from the plain
+        // text-anchor watermark below, so it's handled and returned early.
+        // Trigger with position = "banner-bottom" | "banner-top" | "banner-center".
+        if (String(position).toLowerCase().startsWith('banner')) {
+            const vAlign = String(position).toLowerCase().replace('banner-', '') || 'bottom';
+            drawBannerWatermark(ctx, canvasW, canvasH, opts, ['top', 'center', 'bottom'].includes(vAlign) ? vAlign : 'bottom');
+            ctx.restore();
+            return;
+        }
+
         // Calculate anchor position
         const { x, y, textAlign, textBaseline } = getAnchor(position, canvasW, canvasH, margin);
 
@@ -278,6 +291,102 @@
         }
 
         ctx.restore();
+    }
+
+    /**
+     * Draws the boxed "website credit" banner layout: a white box with a
+     * black border and centered black text, plus thin black horizontal
+     * rules running from the box out toward the left/right edges of the
+     * image (stopping `margin` px short of each edge).
+     *
+     * All sizing (box padding, border width, rule thickness, corner
+     * radius) is derived from the resolved font size, so no extra Supabase
+     * columns are needed beyond the ones the watermark already supports:
+     *   - text    → the label drawn inside the box (e.g. "© www.site.com")
+     *   - font    → e.g. "20px Arial" — controls text AND box scale
+     *   - scale   → additional multiplier on font size
+     *   - margin  → distance from the box to the bottom/top edge, AND the
+     *               distance the side rules stop short of the left/right edges
+     *   - opacity → overall alpha (set opacity:1 to fully match a solid
+     *               white/black banner like a printed photo credit)
+     *   - cornerRadius (optional) → override the box's corner radius in px;
+     *               omit to auto-scale with font size (~28% of font size)
+     *
+     * @param {string} vAlign — 'bottom' | 'top' | 'center'
+     */
+    function drawBannerWatermark(ctx, canvasW, canvasH, opts, vAlign) {
+        const { text, font = '24px sans-serif', scale = 1.0, margin = 20, cornerRadius } = opts;
+        if (!text) return; // nothing to draw — box+lines with no label doesn't make sense
+
+        const fontSizePx = Math.max(8, Math.round((parseInt(font) || 24) * (parseFloat(scale) || 1.0)));
+        const fontFamily = font.replace(/^\d+px\s*/, '') || 'Arial, sans-serif';
+        ctx.font = `500 ${fontSizePx}px ${fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        const textW = ctx.measureText(text).width;
+
+        const padX = Math.round(fontSizePx * 0.75);
+        const padY = Math.round(fontSizePx * 0.45);
+        const boxW = textW + padX * 2;
+        const boxH = fontSizePx + padY * 2;
+        const borderWidth = Math.max(1, Math.round(fontSizePx * 0.06));
+        const radius = Math.min(
+            boxH / 2,
+            Number.isFinite(parseFloat(cornerRadius)) ? parseFloat(cornerRadius) : Math.round(fontSizePx * 0.28)
+        );
+
+        const cx = canvasW / 2;
+        const m = margin || 20;
+        let boxY; // top of box
+        if (vAlign === 'top') {
+            boxY = m;
+        } else if (vAlign === 'center') {
+            boxY = (canvasH - boxH) / 2;
+        } else {
+            boxY = canvasH - m - boxH; // bottom (default)
+        }
+        const boxX = cx - boxW / 2;
+        const lineY = boxY + boxH / 2;
+
+        // Box: white fill, black border — rounded rect
+        traceRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = borderWidth;
+        ctx.strokeStyle = '#000000';
+        ctx.stroke();
+
+        // Horizontal rules running from the box out to near the image edges
+        ctx.lineWidth = Math.max(1, Math.round(fontSizePx * 0.05));
+        ctx.strokeStyle = '#000000';
+        ctx.beginPath();
+        ctx.moveTo(m, lineY);
+        ctx.lineTo(boxX, lineY);
+        ctx.moveTo(boxX + boxW, lineY);
+        ctx.lineTo(canvasW - m, lineY);
+        ctx.stroke();
+
+        // Centered black text on top
+        ctx.fillStyle = '#000000';
+        ctx.fillText(text, cx, lineY + Math.round(fontSizePx * 0.03));
+    }
+
+    // Traces a rounded-rect path on ctx (manual path — doesn't rely on the
+    // newer ctx.roundRect() so it works on older Chromium builds too).
+    function traceRoundedRect(ctx, x, y, w, h, r) {
+        const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.lineTo(x + w - rr, y);
+        ctx.arcTo(x + w, y, x + w, y + rr, rr);
+        ctx.lineTo(x + w, y + h - rr);
+        ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+        ctx.lineTo(x + rr, y + h);
+        ctx.arcTo(x, y + h, x, y + h - rr, rr);
+        ctx.lineTo(x, y + rr);
+        ctx.arcTo(x, y, x + rr, y, rr);
+        ctx.closePath();
     }
 
     /**
