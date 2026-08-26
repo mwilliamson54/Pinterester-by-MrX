@@ -20,6 +20,51 @@
         return arr;
     }
 
+    /**
+     * FIX (see root-cause notes below): TIFF's "Ascii" tag type -- used for
+     * ImageDescription, Artist, Copyright, UserComment, DateTime, and every
+     * other non-"XP" string tag -- can only safely hold single-byte Latin-1
+     * characters (character codes 0-255). piexifjs does not check this: it
+     * just hands whatever JS string it's given straight through as if every
+     * character were already one byte.
+     *
+     * The moment a value contains a character outside that range -- most
+     * commonly a "smart"/typographic character like an em dash "—", a curly
+     * quote, or an ellipsis "…", all very common in AI-written captions --
+     * everything piexif writes into the file from that point on silently
+     * desyncs. The file still opens far enough for basic tools to read the
+     * first few tags, but every real image viewer, which has to walk the
+     * whole marker chain to reach the actual picture, hits that broken
+     * region and fails outright. No exception is thrown anywhere in this
+     * pipeline when that happens, so it fails completely silently.
+     *
+     * This replaces the common typographic characters with plain-ASCII
+     * equivalents, and strips anything else outside the safe 0-255 range,
+     * so a value can never reach piexif's Ascii serializer with a character
+     * it can't represent. Characters already in the Latin-1 range (e.g. the
+     * "©" copyright symbol) are untouched -- they were never the problem.
+     */
+    function sanitizeForAsciiTag(str) {
+        if (typeof str !== 'string') return str;
+        const replacements = {
+            '\u2014': '-',   // em dash —
+            '\u2013': '-',   // en dash –
+            '\u2018': "'",   // left single quote '
+            '\u2019': "'",   // right single quote '
+            '\u201C': '"',   // left double quote "
+            '\u201D': '"',   // right double quote "
+            '\u2026': '...', // ellipsis …
+            '\u00A0': ' '    // non-breaking space
+        };
+        const withCommonSwaps = str.replace(
+            /[\u2014\u2013\u2018\u2019\u201C\u201D\u2026\u00A0]/g,
+            ch => replacements[ch]
+        );
+        // Anything still outside 0-255 (emoji, CJK, Cyrillic, etc.) is
+        // dropped rather than silently corrupting the rest of the file.
+        return withCommonSwaps.replace(/[^\x00-\xFF]/g, '');
+    }
+
     // Build the piexif exifObj ({ "0th": {...}, "Exif": {...}, ... }) from our
     // mapped dot-notation dictionary (e.g. { "0th.ImageDescription": "..." }).
     function buildExifObj(mappedExif) {
@@ -52,13 +97,15 @@
 
                 if (tagId !== undefined) {
                     if (tagStr.startsWith('XP') && typeof value === 'string') {
+                        // XP* tags are UCS2/UTF-16LE under the hood, so they
+                        // can safely carry any Unicode character as-is.
                         exifObj[ifd][tagId] = stringToUcs2(value);
                     } else if (Array.isArray(value) && tagStr.startsWith('XP')) {
                         exifObj[ifd][tagId] = stringToUcs2(value.join('; '));
                     } else if (Array.isArray(value)) {
-                        exifObj[ifd][tagId] = value.join(', ');
+                        exifObj[ifd][tagId] = sanitizeForAsciiTag(value.join(', '));
                     } else {
-                        exifObj[ifd][tagId] = String(value);
+                        exifObj[ifd][tagId] = sanitizeForAsciiTag(String(value));
                     }
                 }
             }
