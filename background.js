@@ -531,11 +531,15 @@ async function startGeneration(resumeTabId) {
           // 3. No supported page open anywhere — report error and exit
           const msg = 'No supported generator page found. Please open one of:\n- Flow: https://labs.google/fx/tools/flow/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
           logToExtension('warn', 'Background', 'startGeneration aborted — no supported tab found. ' + msg.split('\n')[0]);
+          // Flip the gating flags FIRST, before anything below (which
+          // unblocks the pipeline/UI) can race a new startGeneration() call
+          // in while loopActive/isRunning were still stale-true.
+          isRunning = false;
+          loopActive = false; loopActiveSince = null;
+          markLoopProgress('idle');
           notifyPopup('generationError', { message: msg });
           await _reportPipelineStartFailure('No supported generator page found');
           await _failQueuedItems('No supported generator page found');
-          isRunning = false;
-          loopActive = false; loopActiveSince = null;
           await ext.storage.local.set({ isRunning: false });
           return;
         }
@@ -593,13 +597,17 @@ async function startGeneration(resumeTabId) {
     if (!checkRes) {
       const reason = `checkPage failed: ${checkErr?.message || 'unsupported page'}`;
       logToExtension('warn', 'Background', `startGeneration aborted — checkPage never succeeded on tab ${currentTabId} (${checkErr?.message || 'unknown reason'}).`);
+      // Same ordering fix as the "no supported tab" branch above: flip the
+      // gating flags before _reportPipelineStartFailure()/_failQueuedItems()
+      // can unblock the pipeline into calling startGeneration() again.
+      isRunning = false;
+      loopActive = false; loopActiveSince = null;
+      markLoopProgress('idle');
       notifyPopup('generationError', {
         message: 'Please navigate to a supported page:\n- Flow: https://labs.google/fx/tools/flow/project\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image\n- Meta AI: https://www.meta.ai/media\n- Grok: https://x.com/i/grok'
       });
       await _reportPipelineStartFailure(reason);
       await _failQueuedItems(reason);
-      isRunning = false;
-      loopActive = false; loopActiveSince = null;
       await ext.storage.local.set({ isRunning: false });
       return;
     }
@@ -800,8 +808,23 @@ async function startGeneration(resumeTabId) {
         }
       }
     }
-    // Generation complete
+    // Generation complete.
+    // Flip loopActive/isRunning to their "done" values FIRST and
+    // synchronously — before the awaited storage write and notifications
+    // below. deliverGenerationResult() (called per-item inside
+    // runFlowSequentialGeneration()/the generic loop above, the instant each
+    // image is captured) is what unblocks modules/pipeline.js to process its
+    // next record, and that next record can call startGeneration() again
+    // within milliseconds. If loopActive/isRunning stayed true across the
+    // await below, a fast next record could lose that race and see
+    // loopActive still true — a spurious "loopActive" rejection for a loop
+    // that had, in truth, already finished. (tryStartGeneration()'s
+    // stale/stall recovery exists for a genuinely hung loop; this fixes the
+    // separate, non-hung "just finished" case instead of leaning on that
+    // recovery window to paper over it.)
     isRunning = false;
+    loopActive = false; loopActiveSince = null;
+    markLoopProgress('idle');
     await ext.storage.local.set({ isRunning: false });
     notifyPopup('generationComplete', {});
 
@@ -815,6 +838,8 @@ async function startGeneration(resumeTabId) {
       });
     }
   } finally {
+    // Idempotent safety net for every OTHER exit path (thrown errors, the
+    // fatalDisconnect break, etc.) that doesn't already reset these above.
     loopActive = false; loopActiveSince = null;
     markLoopProgress('idle');
     // Notify any pipeline waiters that the loop is gone so they fail fast
@@ -1592,10 +1617,11 @@ const FLOW_DOWNLOAD_DOMAIN_HINTS = [
 
 const FLOW_2K_DEFAULT_TIMEOUT_MS = 90000;
 
-// Flow's "2K" output should have at least one dimension >= 1800px.
-// Keep this slightly below 2048 so normal 2K landscape/portrait outputs
-// pass even if Flow uses a slightly different exact dimension.
-const FLOW_2K_MIN_LONG_EDGE = 1800;
+// Flow's "2K" output is normally 1992x2400. Qualify on WIDTH specifically
+// (not whichever edge happens to be longer) and keep the floor comfortably
+// below 1992 so normal 2K outputs still pass even if Flow uses a slightly
+// different exact width.
+const FLOW_2K_MIN_WIDTH = 1500;
 
 
 /**
@@ -1936,7 +1962,7 @@ async function inspectFlowDownloadCandidate(watchId, downloadId) {
           {
             action: 'inspectFlow2KDataUrl',
             dataUrl: result.dataUrl,
-            minLongEdge: FLOW_2K_MIN_LONG_EDGE
+            minWidth: FLOW_2K_MIN_WIDTH
           }
         );
       } catch (e) {
