@@ -1512,13 +1512,14 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
           image.onerror = () => reject(new Error('Browser could not decode downloaded image'));
           image.src = dataUrl;
         });
-        const minWidth = Number(message.minWidth) || 1500;
-        const qualifies = (dimensions.width || 0) >= minWidth;
+        const longEdge = Math.max(dimensions.width || 0, dimensions.height || 0);
+        const minLongEdge = Number(message.minLongEdge) || 1800;
         sendResponse({
-          success: qualifies,
+          success: longEdge >= minLongEdge,
           width: dimensions.width,
           height: dimensions.height,
-          error: qualifies ? null : `downloaded image is ${dimensions.width}x${dimensions.height} (width ${dimensions.width}px), below 2K width threshold (${minWidth}px)`
+          longEdge,
+          error: longEdge >= minLongEdge ? null : `downloaded image is ${dimensions.width}x${dimensions.height}, below 2K threshold`
         });
       } catch (e) {
         sendResponse({ success: false, error: e.message });
