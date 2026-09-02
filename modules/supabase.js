@@ -177,7 +177,7 @@
      * @param {number} [staleMinutes=10]
      * @returns {Promise<number>} number of records reclaimed
      */
-    async function reclaimStuckRecords(cfg, staleMinutes = 10) {
+    async function reclaimStuckRecords(cfg, staleMinutes = 20) {
         const { supabaseUrl, supabaseAnonKey, supabaseTable } = cfg;
         if (!supabaseUrl || !supabaseAnonKey || !supabaseTable) return 0;
 

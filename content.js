@@ -2216,6 +2216,28 @@ async function generateImage(prompt, itemId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Image dimension measurement from data URL
+// ─────────────────────────────────────────────────────────────────────────
+// Decodes a data URL in-browser and returns the actual pixel dimensions of
+// the encoded image. This is the only reliable way to know whether a capture
+// is the full 2K download (≥1500px wide) or a small on-page tile preview.
+function getImageDataUrlDimensions(dataUrl) {
+  return new Promise((resolve) => {
+    if (!dataUrl || !dataUrl.startsWith('data:')) {
+      return resolve({ width: 0, height: 0 });
+    }
+    try {
+      const img = new Image();
+      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => resolve({ width: 0, height: 0 });
+      img.src = dataUrl;
+    } catch (e) {
+      resolve({ width: 0, height: 0 });
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Flow "2K Upscaled" download capture
 // ─────────────────────────────────────────────────────────────────────────
 // The results grid only ever shows Flow's small on-page preview -- there is
@@ -2692,7 +2714,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
     try {
       const expected = getFlowExpectedCount();
       console.log('BulkyGen Flow: expecting up to ' + expected + ' image(s)');
-      const resultImgs = await waitForFlowResults(beforeKeys, flowRunIdentity, expected, 120000);
+      const resultImgs = await waitForFlowResults(beforeKeys, flowRunIdentity, expected, 300000);
       console.log('BulkyGen Flow: detected ' + resultImgs.length + ' new image(s)');
       for (const img of resultImgs) {
         const src = img.currentSrc || img.src || '';
@@ -2701,16 +2723,33 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
           let data = null;
           let capturedAs2K = false;
 
-          // Prefer Flow's real "2K Upscaled" download; fall back to the
-          // plain on-page preview if that doesn't pan out for any reason.
-          try {
-            data = await captureFlow2KUpscaled(img);
-            if (data) capturedAs2K = true;
-          } catch (e2k) {
-            console.log('BulkyGen Flow: 2K attempt threw, falling back to standard capture:', e2k.message);
+          // Prefer Flow's real "2K Upscaled" download.
+          // Retry up to 3 times with menu cleanup between attempts to handle
+          // transient hover/menu failures before falling back to the 1K preview.
+          const MAX_2K_ATTEMPTS = 3;
+          for (let attempt2k = 1; attempt2k <= MAX_2K_ATTEMPTS; attempt2k++) {
+            try {
+              console.log(`BulkyGen Flow: 2K capture attempt ${attempt2k}/${MAX_2K_ATTEMPTS} for tile`);
+              data = await captureFlow2KUpscaled(img);
+              if (data) {
+                capturedAs2K = true;
+                console.log(`BulkyGen Flow: 2K capture succeeded on attempt ${attempt2k}`);
+                break;
+              }
+            } catch (e2k) {
+              console.log(`BulkyGen Flow: 2K attempt ${attempt2k} threw: ${e2k.message}`);
+            }
+
+            if (attempt2k < MAX_2K_ATTEMPTS) {
+              // Close any open menus between retries to reset the menu state
+              try { pressKey(document.body, 'Escape', {}); } catch (_) { /* ignore */ }
+              await waitUnthrottled(400);
+            }
           }
 
           if (!data) {
+            // All 2K attempts failed — fall back to the standard on-page 1K preview
+            console.log('BulkyGen Flow: all 2K attempts failed, falling back to 1K preview capture');
             data = await getImageAsBase64(src, img);
           }
 
@@ -2719,6 +2758,12 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
               console.log('BulkyGen Flow: skipping duplicate of an already-captured image');
               continue;
             }
+            // Measure the REAL pixel dimensions of the captured image data string
+            const realDims = await getImageDataUrlDimensions(data);
+            const capturedW = realDims.width || img.naturalWidth || img.width || 0;
+            const capturedH = realDims.height || img.naturalHeight || img.height || 0;
+            const resolutionLabel = (capturedAs2K && capturedW >= 1500) ? '2K' : '1K_fallback';
+            console.log(`BulkyGen Flow: captured image REAL dimensions ${capturedW}x${capturedH}, resolution: ${resolutionLabel}`);
             __capturedResultKeys.add(elementKey(img));
             __capturedResultSrcs.add(src);
             __capturedDataUrls.add(data);
@@ -2727,9 +2772,9 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
               meta: {
                 ...meta,
                 src,
-                width: img.naturalWidth || img.width || 0,
-                height: img.naturalHeight || img.height || 0,
-                resolution: capturedAs2K ? '2K' : undefined
+                width: capturedW,
+                height: capturedH,
+                resolution: resolutionLabel
               }
             });
           }
@@ -2744,9 +2789,25 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
       console.log('BulkyGen Flow: result wait error:', waitErr.message);
     }
 
+    // Fix 2: Return success:false when no images were captured.
+    // Previously this returned { success: true, imageData: null } which caused
+    // the background loop to silently mark the item completed with no data,
+    // then the pipeline's result check would throw, triggering a full re-generation.
+    if (images.length === 0) {
+      clientLog('warn', 'Flow', `submitFlowPrompt: prompt submitted but no images captured (itemId=${itemId})`);
+      return {
+        success: false,
+        error: 'Flow generation produced no capturable images',
+        imageData: null,
+        multipleImages: [],
+        itemId: itemId ?? null,
+        meta: { ...meta, captured: 0, submitted: submitted, registered: injected.registered }
+      };
+    }
+
     return {
       success: true,
-      imageData: images.length ? images[0].imageData : null,
+      imageData: images[0].imageData,
       multipleImages: images,
       itemId: itemId ?? null,
       meta: { ...meta, captured: images.length, submitted: submitted, registered: injected.registered }

@@ -241,6 +241,16 @@ chrome.action.onClicked.addListener(async (tab) => {
   console.log('Action icon clicked. Native sidePanel behavior should handle this.');
 });
 
+ext.runtime.onConnect.addListener((port) => {
+  if (port.name === 'bulkygen-keepalive') {
+    port.onMessage.addListener((msg) => {
+      if (msg === 'ping') {
+        try { port.postMessage('pong'); } catch (_) {}
+      }
+    });
+  }
+});
+
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startGeneration') {
     sendResponse(tryStartGeneration());
@@ -888,7 +898,7 @@ async function runFlowSequentialGeneration(queue, delay) {
         // made this loop spin and always burn through the full 300s pipeline
         // timeout. Now we wait for the content script's pushed result instead
         // of resubmitting whenever the error looks like a closed channel.
-        const __flowWaiter = registerResultWaiter(queue[i].id, 180000);
+        const __flowWaiter = registerResultWaiter(queue[i].id, 300000);
         let result;
         markLoopProgress('flow_submit');
         logToExtension('info', 'Flow', `Sending flowSubmitPrompt for item ${queue[i].id} (prompt ${i + 1}/${queue.length})...`);
@@ -929,7 +939,7 @@ async function runFlowSequentialGeneration(queue, delay) {
             logToExtension('warn', 'Flow', `flowSubmitPrompt send failed (${smsg}); reinjecting content script and retrying once...`);
             await ensureTabContentScript(currentTabId, true);
             await sleep(400);
-            const __flowWaiter2 = registerResultWaiter(queue[i].id, 180000);
+            const __flowWaiter2 = registerResultWaiter(queue[i].id, 300000);
             markLoopProgress('flow_submit_retry');
             try {
               result = await Promise.race([
@@ -983,10 +993,18 @@ async function runFlowSequentialGeneration(queue, delay) {
 
         for (let n = 0; n < freshFlowImgs.length; n++) {
           try {
+            const fImg = freshFlowImgs[n];
+            const fW = fImg.meta?.width || 0;
+            const fH = fImg.meta?.height || 0;
+            const fRes = fImg.meta?.resolution || 'unknown';
+            console.log(`🖼️ Flow image ${n + 1}/${freshFlowImgs.length}: ${fW}x${fH}, resolution: ${fRes}`);
+            if (fRes === '1K_fallback' && fW > 0 && fW < 1500) {
+              logToExtension('warn', 'Flow', `Image ${n + 1} is a 1K fallback (${fW}x${fH}) — 2K capture failed. Pipeline will validate and may retry.`);
+            }
             const label = freshFlowImgs.length > 1
               ? `${queue[i].prompt} (${n + 1}/${freshFlowImgs.length})`
               : queue[i].prompt;
-            await saveGeneratedImage(freshFlowImgs[n].imageData, label, queue[i].id, freshFlowImgs[n].meta);
+            await saveGeneratedImage(fImg.imageData, label, queue[i].id, fImg.meta);
           } catch (saveError) {
             console.error('Flow image save error (continuing):', saveError);
           }
@@ -1824,9 +1842,18 @@ async function saveGeneratedImage(imageData, prompt) {
   const id = `${timestamp}-${Math.random().toString(16).slice(2)}`;
   const { blob, mime } = dataUrlToBlob(imageData);
 
-  // Log what type of media we're saving
+  // Log what type of media we're saving, including dimensions and resolution
   const mediaType = mime.startsWith('video/') ? 'video' : 'image';
-  console.log(`💾 Saving ${mediaType} (${mime}), size: ${blob.size} bytes`);
+  const imgW = meta?.width || 0;
+  const imgH = meta?.height || 0;
+  const resolution = meta?.resolution || 'unknown';
+  console.log(`💾 Saving ${mediaType} (${mime}), size: ${blob.size} bytes, dimensions: ${imgW}x${imgH}, resolution: ${resolution}`);
+
+  // Warn if a 1K fallback image slipped through without rejection
+  if (imgW > 0 && imgW < 1500 && resolution === '1K_fallback') {
+    console.warn(`⚠️ BulkyGen: Saving 1K fallback image (${imgW}x${imgH}) — 2K capture failed for all attempts. Pipeline dimension gate should have caught this.`);
+    logToExtension('warn', 'Background', `Saving 1K fallback image ${imgW}x${imgH} for itemId=${itemId} — 2K upscale capture failed.`);
+  }
 
   // Persist full image bytes in IndexedDB (avoids storage.local quota).
   if (!globalThis.bulkygenImageStore) throw new Error('IndexedDB image store not available');
