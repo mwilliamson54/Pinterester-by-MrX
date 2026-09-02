@@ -85,70 +85,6 @@
     let _lastPollWasNetworkRetry = false; // true right after a quiet one-shot retry for a transient "Failed to fetch"
     let _consecutiveErrors = 0; // count of back-to-back poll failures, for backoff
 
-    // ── Generation result cache ─────────────────────────────────────────────────
-    // Caches generation results keyed by Supabase record ID so that post-generation
-    // failures (Drive upload, Supabase update, metadata embedding) do NOT trigger
-    // a re-generation of the same prompt. This is the primary fix for BUG 1
-    // (duplicate processing): previously, _processWithRetry would call processRecord
-    // from scratch, re-creating a synthetic queue item and submitting the same
-    // prompt to Flow again even though the image was already captured.
-    //
-    // Cache entries are:
-    //   - SET after a successful generation (Stage 3)
-    //   - USED on retry instead of re-generating
-    //   - INVALIDATED if the cached image fails dimension validation
-    //   - CLEARED on successful completion or final failure
-    const _generationCache = new Map();
-
-    async function getCachedGenResult(id) {
-        if (_generationCache.has(id)) return _generationCache.get(id);
-        try {
-            const ext = globalThis.ext;
-            if (ext?.storage?.local) {
-                const stored = await ext.storage.local.get(['gen_cache_' + id]);
-                const val = stored ? stored['gen_cache_' + id] : null;
-                if (val) {
-                    _generationCache.set(id, val);
-                    return val;
-                }
-            }
-        } catch (_) {}
-        return null;
-    }
-
-    async function setCachedGenResult(id, val) {
-        _generationCache.set(id, val);
-        try {
-            const ext = globalThis.ext;
-            if (ext?.storage?.local) {
-                await ext.storage.local.set({ ['gen_cache_' + id]: val });
-            }
-        } catch (_) {}
-    }
-
-    async function clearCachedGenResult(id) {
-        _generationCache.delete(id);
-        try {
-            const ext = globalThis.ext;
-            if (ext?.storage?.local) {
-                await ext.storage.local.remove(['gen_cache_' + id]);
-            }
-        } catch (_) {}
-    }
-
-    // ── Per-record processing state tracker ─────────────────────────────────────
-    // Tracks the lifecycle state of each record to prevent concurrent processing
-    // and provide diagnostic logging. States:
-    //   GENERATING → GENERATED → PROCESSING → UPLOADING → UPDATING_DB → COMPLETED
-    const _processingStates = new Map();
-
-    // Minimum acceptable image width for 2K validation gate.
-    // Images narrower than this are rejected as 1K fallbacks.
-    const MIN_IMAGE_WIDTH = 1500;
-    // Maximum retries specifically for dimension-rejected images before accepting
-    // the best available. Prevents infinite retry loops if Flow's 2K menu changed.
-    const MAX_DIMENSION_RETRIES = 2;
-
     // Registry: pendingResultId → { resolve, reject, timer }
     // Lets the pipeline await the pushed image result from the existing generation loop.
     const _pendingResults = new Map();
@@ -290,168 +226,102 @@
             return;
         }
 
-        log()?.info(TAG, `[STATE] Record ${id}: starting`, { prompt: prompt.slice(0, 60) });
+        log()?.info(TAG, `Processing record ${id}`, { prompt: prompt.slice(0, 60) });
         const startMs = Date.now();
 
         if (_stopFlag) {
             throw new Error('Pipeline stopped by user');
         }
 
-        // ── State tracking ────────────────────────────────────────────────────
-        // Prevent concurrent processing of the same record
-        const existingState = _processingStates.get(id);
-        if (existingState === 'COMPLETED') {
-            log()?.warn(TAG, `[STATE] Record ${id} is already COMPLETED — skipping`);
-            return;
-        }
-
         // ── Stage 1: Record was already atomically claimed (status → 'processing')
         // by claimPendingRecord() before processRecord() was called, so no separate
         // markProcessing() call is needed here (that used to be its own request,
         // which is what created the race condition).
+        await stats()?.setStatus('generating', prompt);
 
-        // ── Stage 2 + 3: Generation (with cache) ─────────────────────────────
-        // Check if we already have a valid cached generation result for this
-        // record. This is the critical BUG 1 fix: if a post-generation stage
-        // (Drive upload, Supabase update) fails and _processWithRetry retries,
-        // we skip re-generating the same prompt and reuse the cached image.
-        let allImages;
-        let imageDataUrl;
-        let primary;
-        const cachedResult = await getCachedGenResult(id);
+        // ── Stage 2: Feed prompt into the existing generation loop ────────────
+        // We create a synthetic queue item and inject it directly into chrome.storage.local
+        // so the existing background loop's startGeneration() picks it up.
+        // The autonomousPipelineItemId is used to match the pushed result.
+        const itemId = `pipeline-${id}-${Date.now()}`;
+        const syntheticQueue = [{
+            id: itemId,
+            prompt,
+            status: 'pending',
+            _pipelineRecordId: id,
+            // Per-record aspect ratio (e.g. "16:9") from Supabase, falling back
+            // to a global default in settings if the record didn't specify one.
+            aspectRatio: record.aspectRatio !== undefined && record.aspectRatio !== null
+                ? record.aspectRatio
+                : (settings.aspectRatio || null)
+        }];
 
-        if (cachedResult && cachedResult.imageDataUrl) {
-            log()?.info(TAG, `[CACHE] Using cached generation result for record ${id} (${cachedResult.allImages.length} image(s), ${cachedResult.imageDataUrl.length} bytes)`);
-            _processingStates.set(id, 'GENERATED');
-            allImages = cachedResult.allImages;
-            imageDataUrl = cachedResult.imageDataUrl;
-            primary = cachedResult.primary;
-        } else {
-            // No cache — run the full generation pipeline
-            _processingStates.set(id, 'GENERATING');
-            await stats()?.setStatus('generating', prompt);
+        const ext = globalThis.ext;
+        if (!ext) throw new Error('ext API not available in pipeline context');
 
-            const itemId = `pipeline-${id}-${Date.now()}`;
-            const syntheticQueue = [{
-                id: itemId,
-                prompt,
-                status: 'pending',
-                _pipelineRecordId: id,
-                // Per-record aspect ratio (e.g. "16:9") from Supabase, falling back
-                // to a global default in settings if the record didn't specify one.
-                aspectRatio: record.aspectRatio !== undefined && record.aspectRatio !== null
-                    ? record.aspectRatio
-                    : (settings.aspectRatio || null)
-            }];
+        // Tell the existing queue system to run this one item
+        await ext.storage.local.set({
+            queue: syntheticQueue,
+            currentIndex: 0,
+            isRunning: true,
+            isPaused: false
+        });
 
-            const ext = globalThis.ext;
-            if (!ext) throw new Error('ext API not available in pipeline context');
+        // Register the waiter BEFORE starting generation so early failures
+        // (no tab / checkPage fail) cannot be delivered into a void and leave
+        // us hanging for 300s.
+        log()?.info(TAG, `Waiting for generation result for item ${itemId}...`);
+        const resultPromise = _awaitGenerationResult(itemId, 300000);
 
-            // Tell the existing queue system to run this one item
-            await ext.storage.local.set({
-                queue: syntheticQueue,
-                currentIndex: 0,
-                isRunning: true,
-                isPaused: false
-            });
-
-            // Register the waiter BEFORE starting generation so early failures
-            // (no tab / checkPage fail) cannot be delivered into a void and leave
-            // us hanging for 300s.
-            log()?.info(TAG, `[STATE] Record ${id}: GENERATING — waiting for result (item ${itemId})...`);
-            const resultPromise = _awaitGenerationResult(itemId, 300000);
-
-            // Prefer in-process start (same service worker) — avoids unreliable
-            // chrome.runtime.sendMessage self-calls that can resolve to null/undefined
-            // without ever invoking startGeneration.
-            let startAck = null;
-            try {
-                if (globalThis.bulkygenGeneration?.tryStart) {
-                    startAck = globalThis.bulkygenGeneration.tryStart();
-                } else {
-                    startAck = await ext.runtime.sendMessage({ action: 'startGeneration' });
-                }
-            } catch (e) {
-                startAck = null;
-                log()?.warn(TAG, `startGeneration signal failed: ${e?.message || e}`);
+        // Prefer in-process start (same service worker) — avoids unreliable
+        // chrome.runtime.sendMessage self-calls that can resolve to null/undefined
+        // without ever invoking startGeneration.
+        let startAck = null;
+        try {
+            if (globalThis.bulkygenGeneration?.tryStart) {
+                startAck = globalThis.bulkygenGeneration.tryStart();
+            } else {
+                startAck = await ext.runtime.sendMessage({ action: 'startGeneration' });
             }
-
-            if (!startAck || startAck.started !== true) {
-                const reason = startAck?.reason || (startAck == null ? 'no_ack' : 'unknown');
-                _abortHungGeneration(`startGeneration not acknowledged (${reason})`);
-                // Reject the waiter if still pending so we don't double-wait
-                try {
-                    deliverGenerationResult(itemId, {
-                        success: false,
-                        error: `startGeneration was not started (reason=${reason})`
-                    });
-                } catch (e) { /* ignore */ }
-                throw new Error(`startGeneration was rejected by background (${reason}) — a previous generation loop is likely still active`);
-            }
-
-            // ── Stage 3: Wait for image result ────────────────────────────────
-            const result = await resultPromise;
-
-            if (!result || !result.success || (!result.imageData && !(result.multipleImages?.length))) {
-                const err = result?.error || 'No image data returned';
-                throw new Error(`Generation failed: ${err}`);
-            }
-
-            // Collect all images returned (Flow x2/x4 may return multiple)
-            allImages = Array.isArray(result.multipleImages) && result.multipleImages.length
-                ? result.multipleImages
-                : [{ imageData: result.imageData, meta: result.meta }];
-
-            log()?.info(TAG, `[STATE] Record ${id}: GENERATED — got ${allImages.length} image(s)`);
-
-            // Process the first image (primary result)
-            primary = allImages[0];
-            imageDataUrl = primary.imageData;
-            if (!imageDataUrl) throw new Error('imageData is empty');
-
-            // ── Dimension validation gate ─────────────────────────────────────
-            // Check image dimensions BEFORE caching. If the image is below the
-            // minimum width (1500px), it's rejected regardless of claimed resolution label.
-            const imgWidth = primary.meta?.width || 0;
-            const imgHeight = primary.meta?.height || 0;
-            const resolution = primary.meta?.resolution || 'unknown';
-            log()?.info(TAG, `[VALIDATE] Record ${id}: image dimensions ${imgWidth}x${imgHeight}, resolution label: ${resolution}`);
-
-            if (imgWidth > 0 && imgWidth < MIN_IMAGE_WIDTH) {
-                // Image is below the 2K threshold. Track how many times we've rejected
-                // on dimensions for this record.
-                const dimRetryCount = (record._dimensionRetries || 0);
-                if (dimRetryCount < MAX_DIMENSION_RETRIES) {
-                    record._dimensionRetries = dimRetryCount + 1;
-                    log()?.warn(TAG, `[VALIDATE] Record ${id}: image width ${imgWidth}px < ${MIN_IMAGE_WIDTH}px minimum — dimension retry ${dimRetryCount + 1}/${MAX_DIMENSION_RETRIES}`);
-                    // Do NOT cache — force a fresh generation attempt next time
-                    throw new Error(`Image width ${imgWidth}px is below the ${MIN_IMAGE_WIDTH}px minimum. Retrying for a full-resolution image.`);
-                } else {
-                    // Exceeded dimension retries — accept the best available with a warning
-                    log()?.warn(TAG, `[VALIDATE] Record ${id}: image width ${imgWidth}px < ${MIN_IMAGE_WIDTH}px — max dimension retries (${MAX_DIMENSION_RETRIES}) exceeded, accepting best available`);
-                }
-            }
-
-            // Cache the validated generation result for this record persistently
-            await setCachedGenResult(id, { allImages, imageDataUrl, primary, cachedAt: Date.now() });
-            _processingStates.set(id, 'GENERATED');
+        } catch (e) {
+            startAck = null;
+            log()?.warn(TAG, `startGeneration signal failed: ${e?.message || e}`);
         }
+
+        if (!startAck || startAck.started !== true) {
+            const reason = startAck?.reason || (startAck == null ? 'no_ack' : 'unknown');
+            _abortHungGeneration(`startGeneration not acknowledged (${reason})`);
+            // Reject the waiter if still pending so we don't double-wait
+            try {
+                deliverGenerationResult(itemId, {
+                    success: false,
+                    error: `startGeneration was not started (reason=${reason})`
+                });
+            } catch (e) { /* ignore */ }
+            throw new Error(`startGeneration was rejected by background (${reason}) — a previous generation loop is likely still active`);
+        }
+
+        // ── Stage 3: Wait for image result ─────────────────────────────────────
+        const result = await resultPromise;
+
+        if (!result || !result.success || (!result.imageData && !(result.multipleImages?.length))) {
+            const err = result?.error || 'No image data returned';
+            throw new Error(`Generation failed: ${err}`);
+        }
+
+        // Collect all images returned (Flow x2/x4 may return multiple)
+        const allImages = Array.isArray(result.multipleImages) && result.multipleImages.length
+            ? result.multipleImages
+            : [{ imageData: result.imageData, meta: result.meta }];
+
+        log()?.info(TAG, `Got ${allImages.length} image(s) for record ${id}`);
+
+        // Process the first image (primary result)
+        const primary = allImages[0];
+        const imageDataUrl = primary.imageData;
+        if (!imageDataUrl) throw new Error('imageData is empty');
 
         const processingStartMs = Date.now();
-
-        // ── Touch Supabase to prevent reclaimStuckRecords ─────────────────
-        // Long post-processing (canvas, metadata, Drive upload) can take several
-        // minutes. Touch updated_at so the record doesn't appear stuck.
-        try {
-            const currentSettings = await cfg()?.get() || settings;
-            await supa()?.updateRecord(currentSettings, id, {
-                updated_at: new Date().toISOString()
-            });
-        } catch (e) {
-            log()?.warn(TAG, `Could not touch updated_at for record ${id}: ${e.message}`);
-        }
-
-        _processingStates.set(id, 'PROCESSING');
 
         // ── Stage 4: Strip metadata + compress (stub in Wave 1) ───────────────
         await stats()?.setStatus('uploading', prompt);
@@ -550,8 +420,7 @@
         const uploadStartMs = Date.now();
         let driveResult = { fileId: null, driveUrl: null, thumbnailUrl: null, size: 0 };
         if (settings.driveEnabled) {
-            _processingStates.set(id, 'UPLOADING');
-            log()?.info(TAG, `[STATE] Record ${id}: UPLOADING to Google Drive`);
+            log()?.info(TAG, 'Google Drive upload enabled — proceeding...');
             const token = await auth()?.getAccessToken(false);
             if (!token) {
                 throw new Error('Google Drive enabled but no valid OAuth token found. Please open settings/dashboard to authenticate.');
@@ -628,8 +497,6 @@
             metadata: newMeta
         };
 
-        _processingStates.set(id, 'UPDATING_DB');
-        log()?.info(TAG, `[STATE] Record ${id}: UPDATING_DB`);
         await supa()?.updateRecord(settings, id, updateFields);
 
         // ── Stage 8: Record statistics ──────────────────────────────────────────
@@ -642,9 +509,7 @@
         });
         await stats()?.setStatus('completed', prompt);
 
-        _processingStates.set(id, 'COMPLETED');
-        await clearCachedGenResult(id); // Cleanup cache on success
-        log()?.info(TAG, `[STATE] Record ${id} completed in ${totalTimeMs}ms`);
+        log()?.info(TAG, `Record ${id} completed in ${totalTimeMs}ms`);
 
         // Notify the dashboard popup
         const extRuntime = (globalThis.chrome || globalThis.browser)?.runtime;
@@ -717,8 +582,6 @@
             // instead of sitting at 'failed' or waiting for the 10-minute
             // stuck-record reclaim sweep.
             log()?.info(TAG, `Record ${record.id} processing halted by stop request; returning to pending`);
-            await clearCachedGenResult(record.id); // Clear cache on stop
-            _processingStates.delete(record.id);
             try {
                 const currentSettings = await cfg()?.get() || settings;
                 await supa()?.updateRecord(currentSettings, record.id, {
@@ -737,8 +600,6 @@
 
         // All retries exhausted
         log()?.error(TAG, `Record ${record.id} failed after ${maxRetries + 1} attempts: ${lastError?.message}`);
-        await clearCachedGenResult(record.id); // Clear cache on final failure
-        _processingStates.delete(record.id);
         await stats()?.recordFailed();
         await stats()?.setLastError(lastError?.message || 'Unknown error');
         try {
