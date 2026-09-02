@@ -23,12 +23,8 @@ window.__BULKYGEN_CS_LOADED__ = true;
 // extension recovers a dead/stale content script (e.g. after the service
 // worker restarts and the old message channel stops responding). When that
 // recovery attempt failed with a SyntaxError, the tab was left with only the
-// old, disconnected listener -- so the "fetchUrlAsBase64" message used to
-// pull the real Flow "2K Upscaled" download's bytes had nowhere to land.
-// That silent failure was falling through to a background-side fetch of a
-// blob: URL (which can never succeed outside the tab that created it), so
-// the 2K capture reported failure, the pipeline fell back to the 1K
-// on-page image, and the real 2K file was deleted anyway during cleanup.
+// old, disconnected listener, breaking any messages that needed the page's
+// own context to run.
 (function () {
 if (window.__BULKYGEN_CS_FULLY_INIT__) {
   return;
@@ -1496,38 +1492,6 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async response
   }
 
-  if (message.action === 'inspectFlow2KDataUrl') {
-    // This check runs in the page because the service worker has no Image DOM.
-    // It verifies the bytes caught from a browser download are actually an
-    // upscaled 2K asset before the background assigns them to a prompt.
-    (async () => {
-      try {
-        const dataUrl = message.dataUrl;
-        if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
-          throw new Error('Downloaded payload is not an image data URL');
-        }
-        const image = new Image();
-        const dimensions = await new Promise((resolve, reject) => {
-          image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
-          image.onerror = () => reject(new Error('Browser could not decode downloaded image'));
-          image.src = dataUrl;
-        });
-        const longEdge = Math.max(dimensions.width || 0, dimensions.height || 0);
-        const minLongEdge = Number(message.minLongEdge) || 1800;
-        sendResponse({
-          success: longEdge >= minLongEdge,
-          width: dimensions.width,
-          height: dimensions.height,
-          longEdge,
-          error: longEdge >= minLongEdge ? null : `downloaded image is ${dimensions.width}x${dimensions.height}, below 2K threshold`
-        });
-      } catch (e) {
-        sendResponse({ success: false, error: e.message });
-      }
-    })();
-    return true;
-  }
-
   if (message.action === 'generateImage') {
     const __genItemId = message.itemId;
     const __pushResult = (result) => {
@@ -2120,6 +2084,24 @@ let __kaLingerTimer = null;
 // so the pipeline fails fast instead of waiting 300 seconds.
 let __activeGenerationItemId = null;
 
+// ── Generation exclusivity lock ───────────────────────────────────────────
+// Guarantees at most one prompt is ever mid-flight (submitted, generating,
+// or being captured/downloaded) in this tab at a time. Normally the
+// background loop already waits for one prompt to fully finish before
+// sending the next, but this lock makes that a hard guarantee at the point
+// where prompts actually reach Flow/the page, regardless of what triggers
+// the call (a duplicate message, a stray manual action, anything). Any
+// overlapping call queues behind whatever generation is already running and
+// only starts once that one has completely finished -- success or failure.
+let __generationChain = Promise.resolve();
+function runExclusiveGeneration(taskFn) {
+  const started = __generationChain.then(taskFn, taskFn);
+  // Keep the chain alive for the next caller regardless of outcome, without
+  // letting one failure reject the chain for everyone after it.
+  __generationChain = started.then(() => {}, () => {});
+  return started;
+}
+
 // Flow virtualizes its project grid. Some old tiles are not in the DOM at a
 // prompt's initial snapshot and can appear only because the user scrolls while
 // a new generation is running. Keep a long-lived tile ledger from page load and
@@ -2204,36 +2186,26 @@ function releaseKeepAlive() {
 }
 
 async function generateImage(prompt, itemId) {
-  // Start background keep-alive to prevent tab throttle
-  ensureKeepAlive();
-  __activeGenerationItemId = itemId || null;
-  try {
-    return await generateImageInternal(prompt, itemId);
-  } finally {
-    __activeGenerationItemId = null;
-    releaseKeepAlive();
-  }
+  return runExclusiveGeneration(async () => {
+    // Start background keep-alive to prevent tab throttle
+    ensureKeepAlive();
+    __activeGenerationItemId = itemId || null;
+    try {
+      return await generateImageInternal(prompt, itemId);
+    } finally {
+      __activeGenerationItemId = null;
+      releaseKeepAlive();
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Flow "2K Upscaled" download capture
+// Flow tile identity
 // ─────────────────────────────────────────────────────────────────────────
-// The results grid only ever shows Flow's small on-page preview -- there is
-// no <img src> for the higher-resolution version. The only way to get it is
-// to actually open the tile's own "Download" menu and click "2K Upscaled",
-// same as a person would. That click triggers a REAL browser download, which
-// we catch on the background side (see flowArmDownloadWatch/
-// flowGetDownloadResult in background.js) instead of saving a file to disk.
-//
-// NOTE: Flow doesn't expose a stable id/class for the little download icon
-// that appears when you hover a result tile, so it's matched the same way
-// the rest of this file matches Flow's UI -- by visible text/icon/aria-label
-// -- rather than by id. If Flow changes this markup, capture2K will simply
-// fail fast and the pipeline falls back to the standard preview capture (see
-// submitFlowPrompt), so this is safe to leave on by default.
-
 // Find the tile container for a given result image (Flow tags each result
-// tile with a stable data-tile-id attribute, unlike its buttons/menus).
+// tile with a stable data-tile-id attribute, unlike its buttons/menus). Used
+// to tell genuinely new results apart from old tiles that scroll/virtualize
+// back into view (see shouldRejectFlowTileForRun below).
 function findFlowTileContainer(img) {
   // A generic parent is not a safe fallback: it can contain controls for a
   // different tile when Flow virtualizes or reorders the project grid.
@@ -2242,224 +2214,6 @@ function findFlowTileContainer(img) {
 
 function getFlowTileId(img) {
   return findFlowTileContainer(img)?.getAttribute('data-tile-id') || null;
-}
-
-// Find the tile's "More" (⋮ three-dot) button -- this is what you have to
-// HOVER the tile to reveal, then click, to open the menu containing Download.
-// Matched by aria-label "More" or a "more_vert"/"more_horiz" icon ligature,
-// since Flow doesn't expose a stable id/class for it.
-function findFlowTileMoreButton(tile) {
-  if (!tile) return null;
-  const candidates = Array.from(tile.querySelectorAll('button, [role="button"]'));
-  for (const btn of candidates) {
-    const aria = normalizeText(btn.getAttribute('aria-label') || '');
-    const icon = Array.from(btn.querySelectorAll('i')).map(i => normalizeText(i.textContent || '')).join(' ');
-    if (aria === 'more' || aria.includes('more') || /more_vert|more_horiz/.test(icon)) return btn;
-  }
-  return null;
-}
-
-// Dispatch hover events only (no click) -- used for "Download", which must
-// be HOVERED (not clicked) to reveal the 1K/2K Upscaled submenu.
-function flowDispatchHover(el) {
-  if (!el) return;
-  const r = el.getBoundingClientRect();
-  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy };
-  const pBase = { ...base, pointerId: 1, isPrimary: true, pointerType: 'mouse' };
-  try { el.dispatchEvent(new PointerEvent('pointerover', pBase)); } catch { /* ignore */ }
-  try { el.dispatchEvent(new PointerEvent('pointerenter', pBase)); } catch { /* ignore */ }
-  try { el.dispatchEvent(new PointerEvent('pointermove', pBase)); } catch { /* ignore */ }
-  try { el.dispatchEvent(new MouseEvent('mouseover', base)); } catch { /* ignore */ }
-  try { el.dispatchEvent(new MouseEvent('mouseenter', base)); } catch { /* ignore */ }
-  try { el.dispatchEvent(new MouseEvent('mousemove', base)); } catch { /* ignore */ }
-}
-
-// Inside whichever menu is currently open, find the "Download" entry (it
-// itself opens a further submenu, aria-haspopup="menu" -- Flow nests the
-// 1K/2K Upscaled choices one level deeper, revealed on HOVER not click).
-function isVisibleEnabledFlowMenuAction(el) {
-  if (!el || !el.isConnected || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-  try {
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
-    return rect.width > 0 && rect.height > 0;
-  } catch {
-    return false;
-  }
-}
-
-function findFlowDownloadSubmenuTrigger() {
-  const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-  for (const item of items) {
-    if (!isVisibleEnabledFlowMenuAction(item)) continue;
-    if (item.getAttribute('aria-haspopup') !== 'menu') continue;
-    if (normalizeText(item.textContent || '').startsWith('download')) return item;
-  }
-  return null;
-}
-
-// Find the currently visible, enabled "2K Upscaled" menu item. A portal from
-// a prior menu can remain in the DOM briefly, so unscoped text matching is not
-// safe here: it can click an old tile's detached action after the page scrolls.
-function findFlow2KUpscaledButton() {
-  const candidates = Array.from(document.querySelectorAll('button, [role="menuitem"]'));
-  for (const el of candidates) {
-    if (!isVisibleEnabledFlowMenuAction(el)) continue;
-    const text = normalizeText(el.textContent || '');
-    if (text.includes('2k') && text.includes('upscal')) return el;
-  }
-  return null;
-}
-
-// Opens the tile's menu and reveals the "2K Upscaled" option, following the
-// exact confirmed sequence:
-//   1. Hover the tile (reveals its floating toolbar)
-//   2. CLICK the ⋮ "More" button on that toolbar (opens the menu)
-//   3. HOVER (do NOT click) the "Download" entry in that menu -- this reveals
-//      a submenu with 1K / 2K Upscaled
-//   4. Return the "2K Upscaled" button once it appears, for the caller to click
-async function findAndOpenFlow2KOption(img) {
-  const tile = findFlowTileContainer(img);
-  if (!tile) {
-    console.log('BulkyGen Flow: 2K capture - could not find the tile container for this image');
-    return null;
-  }
-
-  // Step 1: hover the tile so its floating toolbar (with the ⋮ button) mounts/shows.
-  flowDispatchHover(tile);
-  await waitUnthrottled(200);
-
-  let moreBtn = null;
-  for (let i = 0; i < 15 && !moreBtn; i++) {
-    moreBtn = findFlowTileMoreButton(tile);
-    if (!moreBtn) await waitUnthrottled(120);
-  }
-  if (!moreBtn) {
-    console.log('BulkyGen Flow: 2K capture - could not find the tile\'s ⋮ "More" button');
-    return null;
-  }
-
-  // Step 2: click the ⋮ "More" button to open the menu.
-  await forceClickViaBackground(moreBtn);
-
-  let downloadEntry = null;
-  for (let i = 0; i < 15 && !downloadEntry; i++) {
-    await waitUnthrottled(120);
-    downloadEntry = findFlowDownloadSubmenuTrigger();
-  }
-  if (!downloadEntry) {
-    console.log('BulkyGen Flow: 2K capture - "Download" entry never appeared in the menu');
-    pressKey(document.body, 'Escape', {});
-    return null;
-  }
-
-  // Step 3: HOVER (not click) "Download" to reveal the 1K/2K Upscaled submenu.
-  flowDispatchHover(downloadEntry);
-
-  let btn = null;
-  for (let i = 0; i < 15 && !btn; i++) {
-    await waitUnthrottled(120);
-    btn = findFlow2KUpscaledButton();
-  }
-
-  if (!btn) {
-    console.log('BulkyGen Flow: 2K capture - "2K Upscaled" option never appeared');
-    pressKey(document.body, 'Escape', {});
-  }
-  return btn;
-}
-
-// Full 2K capture for one generated image tile: opens the menu, clicks
-// "2K Upscaled", catches the real browser download it triggers, and returns
-// the bytes as a data URL -- or null on any failure, so the caller can fall
-// back to the standard on-page preview capture.
-
-// Timeout shared between arming the watcher and waiting on it, so the two
-// values can never drift apart -- background.js gives the watcher a little
-// extra runway past this same number before it's allowed to expire (see
-// armFlowDownloadWatch in background.js), so we never risk disqualifying a
-// watcher this content script is still actively polling.
-const FLOW_2K_CAPTURE_TIMEOUT_MS = 90000;
-
-async function cancelFlowDownloadWatch(watchId, reason) {
-  if (!watchId) return;
-  try {
-    await ext.runtime.sendMessage({ action: 'flowCancelDownloadWatch', watchId, reason });
-  } catch (e) {
-    // The background may have restarted. Its in-memory watcher is then already gone.
-  }
-}
-
-async function captureFlow2KUpscaled(img) {
-  let watchId = null;
-  let captured = false;
-  const tileId = getFlowTileId(img);
-  try {
-    // Do not create a live watcher until the exact 2K option for this tile is
-    // present. A watcher armed before menu discovery survives a failed hover or
-    // stale menu and can steal the next tile's download.
-    if (!tileId || !img.isConnected) {
-      console.log('BulkyGen Flow: 2K capture - source image is not in a stable tile');
-      return null;
-    }
-    const button = await findAndOpenFlow2KOption(img);
-    if (!button) return null;
-
-    // The user may scroll while the menu is opening. Verify that our source
-    // still belongs to the same stable Flow tile before we create download
-    // ownership or execute the irreversible action.
-    if (!img.isConnected || getFlowTileId(img) !== tileId || !isVisibleEnabledFlowMenuAction(button)) {
-      console.log('BulkyGen Flow: 2K capture - tile/menu changed before click; refusing unbound download');
-      return null;
-    }
-
-    // Arm immediately before the one verified click. The background receives
-    // the tile/source identity for diagnostics and rejects overlapping watches
-    // in this tab rather than guessing by the oldest pending request.
-    const armed = await ext.runtime.sendMessage({
-      action: 'flowArmDownloadWatch',
-      timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS,
-      tileId,
-      sourceKey: elementKey(img)
-    });
-    if (!armed || !armed.success) {
-      console.log('BulkyGen Flow: 2K capture - could not arm the download watcher:', armed && armed.error);
-      return null;
-    }
-    watchId = armed.watchId;
-
-    const click = await forceSingleClickViaBackground(button);
-    const clickResult = click && (click.result || click);
-    if (!click || click.ok === false || !clickResult?.found || (!clickResult.calledOnClick && !clickResult.dispatched)) {
-      console.log('BulkyGen Flow: 2K capture - the selected 2K action was not clicked exactly once');
-      return null;
-    }
-
-    const result = await ext.runtime.sendMessage({
-      action: 'flowGetDownloadResult',
-      watchId,
-      timeoutMs: FLOW_2K_CAPTURE_TIMEOUT_MS
-    });
-
-    if (result && result.success && result.dataUrl) {
-      captured = true;
-      console.log('BulkyGen Flow: 2K Upscaled captured successfully for tile', tileId);
-      return result.dataUrl;
-    }
-    console.log('BulkyGen Flow: 2K capture failed:', result && result.error);
-    return null;
-  } catch (e) {
-    console.log('BulkyGen Flow: 2K capture threw:', e.message);
-    return null;
-  } finally {
-    // Closing the menu is harmless. More importantly, a failed/aborted attempt
-    // must relinquish its watch synchronously; expiry-only cleanup lets stale
-    // watches claim downloads from a later image.
-    pressKey(document.body, 'Escape', {});
-    if (watchId && !captured) await cancelFlowDownloadWatch(watchId, '2K capture did not complete');
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2597,6 +2351,10 @@ async function ensureFlowAspectRatio(targetRatio) {
 }
 
 async function submitFlowPrompt(prompt, itemId, aspectRatio) {
+  return runExclusiveGeneration(() => submitFlowPromptInternal(prompt, itemId, aspectRatio));
+}
+
+async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
   if (PROVIDER !== 'flow') {
     clientLog('error', 'Flow', `submitFlowPrompt called but detected provider is "${PROVIDER}", not "flow" — the page BulkyGen is running on doesn't match a Flow project URL.`);
     throw new Error('Flow submit requested on non-Flow page');
@@ -2698,21 +2456,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
         const src = img.currentSrc || img.src || '';
         if (!src) continue;
         try {
-          let data = null;
-          let capturedAs2K = false;
-
-          // Prefer Flow's real "2K Upscaled" download; fall back to the
-          // plain on-page preview if that doesn't pan out for any reason.
-          try {
-            data = await captureFlow2KUpscaled(img);
-            if (data) capturedAs2K = true;
-          } catch (e2k) {
-            console.log('BulkyGen Flow: 2K attempt threw, falling back to standard capture:', e2k.message);
-          }
-
-          if (!data) {
-            data = await getImageAsBase64(src, img);
-          }
+          const data = await getImageAsBase64(src, img);
 
           if (data) {
             if (__capturedDataUrls.has(data)) {
@@ -2728,8 +2472,7 @@ async function submitFlowPrompt(prompt, itemId, aspectRatio) {
                 ...meta,
                 src,
                 width: img.naturalWidth || img.width || 0,
-                height: img.naturalHeight || img.height || 0,
-                resolution: capturedAs2K ? '2K' : undefined
+                height: img.naturalHeight || img.height || 0
               }
             });
           }
@@ -2993,26 +2736,6 @@ async function forceClickViaBackground(btn) {
   }
 }
 
-// Single-shot version of forceClickViaBackground -- fires the real click
-// exactly once instead of twice (see mainWorldSingleClick in background.js).
-// forceClickViaBackground deliberately double-fires as a safety measure that
-// is harmless for buttons with a disabled-state lock (generate button, ratio
-// tabs), but Flow's "2K Upscaled" button has no such lock, so double-firing
-// it was triggering 2-3 real file downloads per click. Used only for that click.
-async function forceSingleClickViaBackground(btn) {
-  if (!btn) return null;
-  try {
-    btn.setAttribute('data-bulkygen-submit', '1');
-    const res = await ext.runtime.sendMessage({ action: 'flowSingleForceClick' });
-    try { console.log('BulkyGen Flow: single force-click ->', JSON.stringify(res && res.result ? res.result : res)); } catch { /* ignore */ }
-    return res;
-  } catch (e) {
-    console.log('BulkyGen Flow: single force-click error:', e.message);
-    return null;
-  } finally {
-    try { btn.removeAttribute('data-bulkygen-submit'); } catch { /* ignore */ }
-  }
-}
 
 // Wait for the generate button to be enabled, then click it; verify submission
 async function clickFlowGenerate(editor, prompt) {

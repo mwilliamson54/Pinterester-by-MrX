@@ -53,9 +53,6 @@ function abortGenerationLoop(reason) {
   loopActive = false;
   loopActiveSince = null;
   markLoopProgress('aborted');
-  // A capture watcher is ownership for exactly one imminent Flow download.
-  // Never carry that ownership into a later run after an abort.
-  try { cancelAllFlowDownloadWatches(`generation aborted: ${msg}`); } catch (e) { /* ignore */ }
   try { ext.storage.local.set({ isRunning: false, isPaused: false }).catch(() => { }); } catch (e) { /* ignore */ }
   if (currentTabId != null) {
     try { ext.tabs.sendMessage(currentTabId, { action: 'bgKeepAlive', on: false }).catch(() => { }); } catch (e) { /* ignore */ }
@@ -98,8 +95,6 @@ function tryStartGeneration(resumeTabId) {
     isRunning = false;
     loopActive = false;
     loopActiveSince = null;
-    // Recovery starts a distinct run; no unclaimed watcher may survive it.
-    try { cancelAllFlowDownloadWatches('generation loop recovered'); } catch (e) { /* ignore */ }
     markLoopProgress('recovered');
   }
   startGeneration(resumeTabId).catch((e) => {
@@ -251,7 +246,6 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     loopActive = false;
     loopActiveSince = null;
     markLoopProgress('stopped');
-    try { cancelAllFlowDownloadWatches('generation stopped'); } catch (e) { /* ignore */ }
     ext.storage.local.set({ isPaused: false, isRunning: false }).catch(() => { });
     stopSwKeepAlive();
     disarmKeepAliveAlarm();
@@ -338,33 +332,6 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: true });
     });
     return true;
-  } else if (message.action === 'flowArmDownloadWatch') {
-    // The content script opens and validates the exact tile menu first, then
-    // arms this single-use lease immediately before its one 2K click.
-    const armed = armFlowDownloadWatch(sender?.tab?.id, message.timeoutMs, {
-      tileId: message.tileId,
-      sourceKey: message.sourceKey
-    });
-    sendResponse(armed);
-    return false;
-  } else if (message.action === 'flowCancelDownloadWatch') {
-    const cancelled = cancelFlowDownloadWatch(message.watchId, message.reason || 'cancelled by Flow content script');
-    sendResponse({ success: cancelled });
-    return false;
-  } else if (message.action === 'flowGetDownloadResult') {
-    waitForFlowDownloadResult(message.watchId, message.timeoutMs).then(result => {
-      sendResponse(result);
-    }).catch(error => {
-      sendResponse({ success: false, error: error.message });
-    });
-    return true; // async response
-  } else if (message.action === 'flowSingleForceClick') {
-    forceSingleClickInPage(sender?.tab?.id).then(result => {
-      sendResponse(result);
-    }).catch(error => {
-      sendResponse({ ok: false, error: error.message });
-    });
-    return true; // async response
   } else if (message.action === 'flowForceClick') {
     forceClickInPage(sender?.tab?.id).then(result => {
       sendResponse(result);
@@ -1387,93 +1354,6 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function forceSingleClickInPage(tabId) {
-  if (tabId == null) return { ok: false, error: 'no tab id' };
-  const scripting = (globalThis.chrome && globalThis.chrome.scripting) ||
-    (globalThis.browser && globalThis.browser.scripting);
-  if (!scripting) return { ok: false, error: 'scripting API unavailable' };
-  try {
-    const results = await scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: mainWorldSingleClick
-    });
-    const out = results && results[0] ? results[0].result : null;
-    console.log('BulkyGen Flow: single force-click result', out);
-    return { ok: true, result: out };
-  } catch (e) {
-    console.error('forceSingleClickInPage failed:', e);
-    return { ok: false, error: e.message };
-  }
-}
-
-// Same idea as mainWorldForceClick above, but fires the button's action
-// EXACTLY ONCE: either the real React onClick handler, OR (only if none was
-// found at all) a single native click -- never both. mainWorldForceClick
-// deliberately fires both a manual handler call AND a full native click
-// sequence as a belt-and-suspenders measure, which is harmless for buttons
-// guarded by a disabled-state lock (generate button, ratio tabs) but was
-// producing 2-3 real file downloads per click on Flow's "2K Upscaled"
-// button, which has no such lock. Used only for that click.
-function mainWorldSingleClick() {
-  const out = { found: false, calledOnClick: false, dispatched: false, handlerDepth: -1, info: '' };
-  try {
-    const el = document.querySelector('[data-bulkygen-submit="1"]');
-    if (!el) { out.info = 'target not found'; return out; }
-    out.found = true;
-
-    const makeEvent = (type, node) => ({
-      type, bubbles: true, cancelable: true, defaultPrevented: false,
-      preventDefault() { this.defaultPrevented = true; },
-      stopPropagation() { }, stopImmediatePropagation() { },
-      isPropagationStopped: () => false,
-      isDefaultPrevented() { return this.defaultPrevented; },
-      persist() { }, nativeEvent: { isTrusted: true, type, bubbles: true, cancelable: true, button: 0, buttons: 1, detail: 1, view: window, clientX: 0, clientY: 0, screenX: 0, screenY: 0, pageX: 0, pageY: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5, target: node, currentTarget: node, preventDefault() { }, stopPropagation() { }, stopImmediatePropagation() { }, composedPath: () => [node] }, currentTarget: node, target: node,
-      button: 0, buttons: 1, detail: 1, view: window, isTrusted: true,
-      clientX: 0, clientY: 0, pointerId: 1, pointerType: 'mouse'
-    });
-
-    let node = el, depth = 0, handler = null, handlerNode = null;
-    while (node && depth < 8) {
-      let props = null;
-      const pk = Object.keys(node).find(k => k.indexOf('__reactProps$') === 0);
-      if (pk && node[pk]) props = node[pk];
-      if (!props) {
-        const fk = Object.keys(node).find(k => k.indexOf('__reactFiber$') === 0);
-        if (fk && node[fk] && node[fk].memoizedProps) props = node[fk].memoizedProps;
-      }
-      if (props && typeof props.onClick === 'function') {
-        handler = props; handlerNode = node; out.handlerDepth = depth; break;
-      }
-      node = node.parentElement; depth++;
-    }
-
-    if (handler) {
-      try {
-        handler.onClick(makeEvent('click', handlerNode));
-        out.calledOnClick = true;
-      } catch (e) { out.info += ' handler err: ' + e.message; }
-    } else {
-      // No React onClick found anywhere -- fall back to a single real click.
-      try {
-        const r = el.getBoundingClientRect();
-        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-        const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0 };
-        const p = { ...base, pointerId: 1, isPrimary: true, pointerType: 'mouse' };
-        el.dispatchEvent(new PointerEvent('pointerdown', { ...p, buttons: 1 }));
-        el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
-        el.dispatchEvent(new PointerEvent('pointerup', { ...p, buttons: 0 }));
-        el.dispatchEvent(new MouseEvent('mouseup', base));
-        el.dispatchEvent(new MouseEvent('click', base));
-        out.dispatched = true;
-      } catch (e) { out.info += ' dispatch err: ' + e.message; }
-    }
-  } catch (e) {
-    out.info += ' fatal: ' + e.message;
-  }
-  return out;
-}
-
 // Fetch cross-origin image as base64 (background script can bypass CORS)
 async function fetchImageAsBase64(imageUrl) {
   try {
@@ -1560,246 +1440,6 @@ async function fetchImageAsBase64(imageUrl) {
       error: error.message
     };
   }
-}
-
-// ── Flow "2K Upscaled" download capture ─────────────────────────────────────
-// Flow's 2K option is a REAL browser download (a file lands in the user's
-// Downloads folder) -- unlike every other capture path in this extension,
-// which just reads an <img src>. So: arm this watcher BEFORE the content
-// script clicks "2K Upscaled", catch the download it triggers, re-fetch the
-// bytes ourselves, then delete the on-disk copy again so nothing is left
-// cluttering the user's Downloads folder.
-//
-// Only downloads that plausibly came from Flow itself (matched against
-// FLOW_DOWNLOAD_DOMAIN_HINTS, below) are ever touched by this watcher. This
-// used to match ANY download that happened to start anywhere in the browser
-// while a watch was active -- which meant a user's own manual download,
-// started at the wrong moment, got silently deleted along with the real
-// duplicates. Scoping the match to Flow's own domain fixes that without
-// giving up duplicate detection for Flow's own downloads.
-// A watcher is an exclusive ownership lease for exactly one browser download.
-// DownloadItem does not expose the originating DOM tile, so allowing several
-// pending watches and assigning a download to the oldest one is inherently
-// unsafe. The content script serializes tile capture; enforce that invariant
-// here as well and reject ambiguity rather than downloading the wrong image.
-const __flowDownloadWatchers = new Map(); // watchId -> { state, downloadId, result, tabId, tileId, sourceKey, armedAt, expiresAt, cleanupTimer }
-const FLOW_DOWNLOAD_DEDUPE_GRACE_MS = 4000;
-const FLOW_DOWNLOAD_DOMAIN_HINTS = ['labs.google'];
-const FLOW_2K_DEFAULT_TIMEOUT_MS = 90000;
-const FLOW_2K_MIN_LONG_EDGE = 1800;
-
-function isLikelyFlowDownload(item) {
-  const haystack = `${item.referrer || ''} ${item.url || ''} ${item.finalUrl || ''}`;
-  return FLOW_DOWNLOAD_DOMAIN_HINTS.some(hint => haystack.includes(hint));
-}
-
-function isLiveFlowDownloadWatch(entry, now = Date.now()) {
-  return !!entry && (entry.state === 'armed' || entry.state === 'claimed' || entry.state === 'fetching') && now < entry.expiresAt;
-}
-
-function getLiveFlowDownloadWatches(now = Date.now()) {
-  return Array.from(__flowDownloadWatchers.values()).filter(entry => isLiveFlowDownloadWatch(entry, now));
-}
-
-function scheduleFlowWatchCleanup(watchId, delayMs = FLOW_DOWNLOAD_DEDUPE_GRACE_MS + 500) {
-  const entry = __flowDownloadWatchers.get(watchId);
-  if (!entry) return;
-  if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
-  entry.cleanupTimer = setTimeout(() => {
-    const current = __flowDownloadWatchers.get(watchId);
-    if (current?.cleanupTimer) clearTimeout(current.cleanupTimer);
-    if (current?.expiryTimer) clearTimeout(current.expiryTimer);
-    __flowDownloadWatchers.delete(watchId);
-  }, Math.max(0, delayMs));
-}
-
-function cancelFlowDownloadWatch(watchId, reason) {
-  const entry = __flowDownloadWatchers.get(watchId);
-  if (!entry) return false;
-  // A completed result is immutable; all other states must immediately give up
-  // ownership so a later tile cannot be contaminated by this attempt.
-  if (entry.state !== 'completed') {
-    entry.state = 'cancelled';
-    entry.resolved = true;
-    entry.resolvedAt = Date.now();
-    entry.result = { success: false, error: reason || '2K download watch cancelled' };
-  }
-  scheduleFlowWatchCleanup(watchId, 0);
-  return true;
-}
-
-function cancelAllFlowDownloadWatches(reason) {
-  for (const watchId of Array.from(__flowDownloadWatchers.keys())) {
-    cancelFlowDownloadWatch(watchId, reason || 'all Flow download watches cancelled');
-  }
-}
-
-// Arm immediately before the verified 2K click. One global live watch is
-// intentional: Chrome's download events have no reliable DOM-tile identity,
-// so concurrent capture is an ambiguity that must fail closed.
-function armFlowDownloadWatch(tabId, timeoutMs, metadata = {}) {
-  const now = Date.now();
-  for (const [watchId, entry] of __flowDownloadWatchers) {
-    if (!isLiveFlowDownloadWatch(entry, now)) {
-      scheduleFlowWatchCleanup(watchId, 0);
-    }
-  }
-  const live = getLiveFlowDownloadWatches(now);
-  if (live.length) {
-    return { success: false, error: 'another Flow 2K capture is still active; refusing ambiguous download ownership' };
-  }
-
-  const watchId = `w-${now}-${Math.random().toString(16).slice(2)}`;
-  const ttl = Math.max(1000, Number(timeoutMs) || FLOW_2K_DEFAULT_TIMEOUT_MS);
-  const entry = {
-    state: 'armed',
-    downloadId: null,
-    resolved: false,
-    result: null,
-    resolvedAt: null,
-    tabId,
-    tileId: metadata.tileId || null,
-    sourceKey: metadata.sourceKey || null,
-    armedAt: now,
-    expiresAt: now + ttl
-  };
-  __flowDownloadWatchers.set(watchId, entry);
-  // If the content side disappears, release ownership at its deadline rather
-  // than leaving a stale watch for the next result.
-  entry.expiryTimer = setTimeout(() => cancelFlowDownloadWatch(watchId, '2K download watch expired'), ttl + 50);
-  return { success: true, watchId };
-}
-
-async function removeDownload(id, reason) {
-  console.log(`BulkyGen Flow: removing ${reason} download id=${id}`);
-  try { await ext.downloads.removeFile(id); } catch (e) { /* ignore */ }
-  try { await ext.downloads.erase({ id }); } catch (e) { /* ignore */ }
-}
-
-ext.downloads?.onCreated?.addListener(async (item) => {
-  // Leave non-Flow downloads completely untouched.
-  if (!isLikelyFlowDownload(item)) return;
-  const now = Date.now();
-  const live = getLiveFlowDownloadWatches(now);
-
-  // Exactly one currently armed watcher may claim a download. There is no
-  // "oldest pending" fallback: that is the race that assigned a later tile's
-  // 2K file to a failed earlier tile and forced the current tile to use 1K.
-  const candidate = live.length === 1 && live[0].state === 'armed' ? live[0] : null;
-  if (candidate) {
-    candidate.downloadId = item.id;
-    candidate.state = 'claimed';
-    candidate.downloadStartedAt = now;
-    console.log(`BulkyGen Flow: claimed 2K download id=${item.id} tile=${candidate.tileId || '?'} file=${item.filename}`);
-    return;
-  }
-
-  // A second download that starts while a capture is already claimed is an
-  // extra fire of the same action. Suppress that duplicate only while a live
-  // capture exists. If there is no live capture, leave the download alone so
-  // delayed/manual Flow downloads are never cancelled by stale extension state.
-  const activeCapture = live[0];
-  if (activeCapture && activeCapture.state !== 'armed') {
-    console.warn(`BulkyGen Flow: suppressing duplicate download id=${item.id}; active tile=${activeCapture.tileId || '?'}`);
-    await removeDownload(item.id, 'duplicate 2K action');
-  }
-});
-
-ext.downloads?.onChanged?.addListener(async (delta) => {
-  if (!delta.state) return;
-  const entry = Array.from(__flowDownloadWatchers.values())
-    .find(candidate => candidate.downloadId === delta.id && candidate.state === 'claimed');
-  if (!entry) return;
-
-  if (delta.state.current === 'interrupted') {
-    entry.state = 'failed';
-    entry.resolved = true;
-    entry.resolvedAt = Date.now();
-    entry.result = { success: false, error: `2K download was interrupted${delta.error?.current ? `: ${delta.error.current}` : ''}` };
-    console.warn(`BulkyGen Flow: claimed 2K download id=${delta.id} was interrupted`);
-    scheduleFlowWatchCleanup(Array.from(__flowDownloadWatchers.entries()).find(([, value]) => value === entry)?.[0]);
-    return;
-  }
-  if (delta.state.current !== 'complete') return;
-
-  entry.state = 'fetching';
-  try {
-    const items = await ext.downloads.search({ id: delta.id });
-    const item = items && items[0];
-    const url = item && (item.finalUrl || item.url);
-    if (!url) throw new Error('Could not determine the downloaded file\'s URL');
-
-    // Fetch blob URLs in their creator tab first; only that context can resolve
-    // Flow's object URL. The fallback still covers ordinary HTTPS assets.
-    let result = null;
-    if (entry.tabId != null) {
-      try {
-        result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
-      } catch (e) {
-        result = null;
-      }
-      if (!result || !result.success) {
-        try {
-          await ensureTabContentScript(entry.tabId, true);
-          result = await ext.tabs.sendMessage(entry.tabId, { action: 'fetchUrlAsBase64', url });
-        } catch (e) {
-          result = null;
-        }
-      }
-    }
-    if (!result || !result.success) result = await fetchImageAsBase64(url);
-
-    // A Flow-domain download alone is not proof that this is the requested 2K
-    // asset. Reject the observed bytes unless the decoded long edge is 2K.
-    if (result?.success && result.dataUrl && entry.tabId != null) {
-      const inspection = await ext.tabs.sendMessage(entry.tabId, {
-        action: 'inspectFlow2KDataUrl', dataUrl: result.dataUrl, minLongEdge: FLOW_2K_MIN_LONG_EDGE
-      });
-      if (!inspection?.success) {
-        result = {
-          success: false,
-          error: `download failed 2K verification for tile ${entry.tileId || '?'}: ${inspection?.error || 'could not confirm image dimensions'}`
-        };
-      } else {
-        result.width = inspection.width;
-        result.height = inspection.height;
-        result.resolution = '2K';
-      }
-    }
-
-    // A cancellation can race the in-tab fetch. Never resurrect a watch that
-    // has already relinquished ownership to the next attempt.
-    if (entry.state !== 'fetching') return;
-    entry.result = result || { success: false, error: '2K download returned no image data' };
-    entry.state = entry.result.success ? 'completed' : 'failed';
-    entry.resolved = true;
-    entry.resolvedAt = Date.now();
-  } catch (e) {
-    if (entry.state === 'fetching') {
-      entry.state = 'failed';
-      entry.resolved = true;
-      entry.resolvedAt = Date.now();
-      entry.result = { success: false, error: e.message };
-    }
-  } finally {
-    await removeDownload(delta.id, 'captured 2K candidate');
-  }
-});
-
-async function waitForFlowDownloadResult(watchId, timeoutMs) {
-  const start = Date.now();
-  const limit = Math.max(1000, Number(timeoutMs) || FLOW_2K_DEFAULT_TIMEOUT_MS);
-  while (Date.now() - start < limit) {
-    const entry = __flowDownloadWatchers.get(watchId);
-    if (!entry) return { success: false, error: 'download watch not found or already cancelled' };
-    if (entry.resolved && entry.result) {
-      scheduleFlowWatchCleanup(watchId);
-      return entry.result;
-    }
-    await sleep(150);
-  }
-  cancelFlowDownloadWatch(watchId, 'timed out waiting for the 2K download to complete');
-  return { success: false, error: 'timed out waiting for the 2K download to complete' };
 }
 
 function notifyPopup(action, data) {
