@@ -33,15 +33,28 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     logToExtension(message.level || 'info', message.tag || 'ContentScript', message.message || '');
     return false;
   } else if (message.action === 'generationResult') {
-    // Content script pushed a finished generation result (reliable delivery
-    // path for long generations whose response channel may have closed).
+    // Content script pushed a finished generation result — this is the
+    // reliable delivery path for long generations whose sendMessage response
+    // channel may have closed (a known MV3 issue). It resolves the LOCAL
+    // waiter that runFlowSequentialGeneration/regenerateSingleItem's own
+    // Promise.race() is awaiting, so the retry-in-place loop can decide what
+    // to do next with this specific sub-attempt.
+    //
+    // It must NOT also forward straight to the pipeline. Content.js pushes
+    // this on every single flowSubmitPrompt attempt, success or fail — but
+    // background.js's own loop has an 8-attempt retry budget per record
+    // before it gives up. Forwarding every raw sub-attempt to the pipeline
+    // used to make it declare the whole record failed after just the FIRST
+    // sub-attempt (while background.js was still legitimately retrying),
+    // which made the pipeline start a second, competing attempt on the same
+    // record. That collided with the still-running first attempt
+    // ("startGeneration rejected — loopActive"), which made the pipeline
+    // force-abort a loop that wasn't actually hung — sometimes right as it
+    // was about to succeed, losing an already-captured image. background.js
+    // already calls bulkygenPipeline.deliverGenerationResult() itself at
+    // the right moments (real success, retries exhausted, fatal disconnect)
+    // — that's the only place a record's outcome should be reported from.
     try { __deliverPushedResult(message.itemId, message.result); } catch (e) { /* ignore */ }
-    // Also deliver to pipeline if this item originated from the autonomous loop
-    try {
-      if (globalThis.bulkygenPipeline) {
-        globalThis.bulkygenPipeline.deliverGenerationResult(message.itemId, message.result);
-      }
-    } catch (e) { /* ignore */ }
     return false;
   } else if (message.action === 'startPipeline') {
     if (globalThis.bulkygenPipeline) {
