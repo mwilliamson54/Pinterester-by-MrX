@@ -32,7 +32,16 @@
       {
          "js": [
             "ext.js",
-            "content.js"
+            "content.js",
+            "content/generation-state.js",
+            "content/messaging.js",
+            "content/result-capture.js",
+            "content/generation-core.js",
+            "content/flow-dom.js",
+            "content/flow-capture.js",
+            "content/providers-generate.js",
+            "content/media-capture.js",
+            "content/unload-guard.js"
          ],
          "matches": [
             "https://labs.google/fx/tools/flow/*",

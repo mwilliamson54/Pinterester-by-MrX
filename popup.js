@@ -141,7 +141,25 @@ async function ensureContentScript(tabId) {
       });
       if (probe && probe[0] && probe[0].result) return true;
     } catch (_) { }
-    await scripting.executeScript({ target: { tabId }, files: ['ext.js', 'content.js'] });
+    // Keep this file list in sync with manifest.json's content_scripts entry
+    // and background/tab-lifecycle.js's ensureTabContentScript -- all three
+    // must inject the exact same files, in the exact same order.
+    await scripting.executeScript({
+      target: { tabId },
+      files: [
+        'ext.js',
+        'content.js',
+        'content/generation-state.js',
+        'content/messaging.js',
+        'content/result-capture.js',
+        'content/generation-core.js',
+        'content/flow-dom.js',
+        'content/flow-capture.js',
+        'content/providers-generate.js',
+        'content/media-capture.js',
+        'content/unload-guard.js',
+      ],
+    });
     return true;
   } catch (e) {
     console.debug('ensureContentScript skipped:', (e && e.message) || e);
