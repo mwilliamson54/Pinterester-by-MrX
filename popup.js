@@ -92,7 +92,7 @@ const FIREFLY_CREATE_URL = 'https://firefly.adobe.com/generate/image';
 // UTILITY FUNCTIONS (preserved from original)
 // ═══════════════════════════════════════════════════════════════════════════
 
-function isFlowUrl(url) { return !!url && url.includes('/fx/tools/flow/project/'); }
+function isFlowUrl(url) { return !!url && (url.includes('/fx/tools/flow/project/') || url.includes('flow.google.com/project/')); }
 function isMetaAIUrl(url) { return !!url && url.includes('meta.ai') && url.includes('/media'); }
 function isGrokUrl(url) { return !!url && url.includes('grok.com') && url.includes('/imagine'); }
 function isDigenUrl(url) { return !!url && url.includes('digen.ai'); }
@@ -104,7 +104,8 @@ function isSupportedUrl(url) {
 
 function extractFlowProjectId(url) {
   if (!url) return null;
-  const match = url.match(/\/fx\/tools\/flow\/project\/([a-f0-9-]+)/i);
+  const match = url.match(/\/fx\/tools\/flow\/project\/([a-f0-9-]+)/i) ||
+                url.match(/flow\.google\.com\/project\/([a-f0-9-]+)/i);
   return match?.[1] || null;
 }
 

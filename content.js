@@ -42,6 +42,7 @@ function detectProvider() {
     const path = url.pathname || '';
 
     if (host === 'labs.google' && path.startsWith('/fx/tools/flow/project/')) return 'flow';
+    if (host === 'flow.google.com' && path.startsWith('/project/')) return 'flow';
     if ((host === 'meta.ai' || host === 'www.meta.ai') && path.includes('/media')) return 'metaai';
     if (host === 'grok.com' && path.startsWith('/imagine')) return 'grok';
     if (host === 'digen.ai') return 'digen';
@@ -51,6 +52,7 @@ function detectProvider() {
   } catch {
     const href = window.location.href || '';
     if (href.startsWith('https://labs.google/fx/tools/flow/project/')) return 'flow';
+    if (href.startsWith('https://flow.google.com/project/')) return 'flow';
     if (href.includes('meta.ai') && href.includes('/media')) return 'metaai';
     if (href.includes('grok.com') && href.includes('/imagine')) return 'grok';
     if (href.includes('digen.ai')) return 'digen';

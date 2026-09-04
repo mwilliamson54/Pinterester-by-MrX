@@ -18,6 +18,7 @@
          ],
          "matches": [
             "https://labs.google/fx/tools/flow/*",
+            "https://flow.google.com/*",
             "https://meta.ai/*",
             "https://www.meta.ai/*",
             "https://grok.com/*",
@@ -45,6 +46,7 @@
          ],
          "matches": [
             "https://labs.google/fx/tools/flow/*",
+            "https://flow.google.com/*",
             "https://meta.ai/*",
             "https://www.meta.ai/*",
             "https://grok.com/*",
@@ -59,6 +61,7 @@
    "description": "Queue a list of prompts and generate them automatically, one line at a time, on supported AI image and video generator sites.",
    "host_permissions": [
       "https://labs.google/*",
+      "https://flow.google.com/*",
       "https://meta.ai/*",
       "https://www.meta.ai/*",
       "https://grok.com/*",
@@ -129,6 +132,7 @@
       {
          "matches": [
             "https://labs.google/*",
+            "https://flow.google.com/*",
             "https://meta.ai/*",
             "https://www.meta.ai/*",
             "https://grok.com/*",

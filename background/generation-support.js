@@ -75,6 +75,7 @@ function registerResultWaiter(itemId, timeoutMs) {
 function isSupportedTabUrl(url) {
   if (!url) return false;
   return url.includes('/fx/tools/flow/project/') ||
+         url.includes('flow.google.com/project/') ||
          (url.includes('meta.ai') && url.includes('/media')) ||
          (url.includes('grok.com') && url.includes('/imagine')) ||
          url.includes('digen.ai') ||
