@@ -229,6 +229,10 @@ async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
     });
     const flowRunIdentity = NS.createFlowRunIdentity(beforeTileIds);
 
+    // Flag this as OUR scroll, not the user's, before it fires -- otherwise
+    // the tile-identity guard above can reject the very tile this submission
+    // is about to create (see markFlowProgrammaticScroll() in generation-core.js).
+    NS.markFlowProgrammaticScroll();
     editor.scrollIntoView({ behavior: 'instant', block: 'center' });
     await NS.waitUnthrottled(150);
 
@@ -579,6 +583,7 @@ async function clickFlowGenerate(editor, prompt) {
   for (let attempt = 0; attempt < 5; attempt++) {
     const target = findFlowSubmitButton(editor) || btn;
     if (target) {
+      NS.markFlowProgrammaticScroll();
       target.scrollIntoView({ behavior: 'instant', block: 'center' });
       await NS.waitUnthrottled(40);
       // Strongest method: call the button's real React onClick from the main world

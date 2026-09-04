@@ -4,10 +4,37 @@
 // so everything here shares state (isRunning, isPaused, etc.) with them
 // exactly as it did when this was all one file.
 
-
+// ── Shared Flow retry envelope ───────────────────────────────────────────────
+// runFlowSequentialGeneration() below retries a single stuck prompt up to
+// FLOW_MAX_RETRIES times in place (same itemId, same tab), each attempt
+// bounded by FLOW_PER_ATTEMPT_TIMEOUT_MS with FLOW_RETRY_BACKOFF_MS between
+// tries. modules/pipeline.js's own hard timeout for a record MUST stay
+// comfortably above this full envelope -- otherwise the pipeline gives up
+// and aborts a Flow run that is still legitimately retrying on its own,
+// which is what previously caused records to bounce between "loopActive"
+// rejections and premature "Generation timeout" failures. Exposed on
+// globalThis so pipeline.js (loaded earlier, but this is only read at
+// runtime) can derive its timeout from the same numbers instead of an
+// independent guess that can silently drift out of sync.
+const FLOW_MAX_RETRIES = 8;
+const FLOW_PER_ATTEMPT_TIMEOUT_MS = 180000;
+const FLOW_RETRY_BACKOFF_MS = 1500;
+// x2 headroom covers the "send failed, reinject, retry once" sub-path within
+// a single attempt, which can itself wait out a second full per-attempt
+// timeout before giving up on that attempt.
+globalThis.BULKYGEN_FLOW_RETRY_BUDGET_MS =
+  (FLOW_MAX_RETRIES + 1) * (FLOW_PER_ATTEMPT_TIMEOUT_MS * 2 + FLOW_RETRY_BACKOFF_MS);
 
 async function startGeneration(resumeTabId) {
   if (loopActive) return; // a loop is already running in this worker
+  // Claim a fresh run token for THIS invocation and remember it in a local
+  // const, not a shared variable. isRunning/loopActive can be flipped back
+  // to true by a restart before an OLD, still-in-flight run has actually
+  // finished — this token is what lets that old run recognize it's been
+  // superseded and stop touching the tab, even though isRunning now reads
+  // true again. See the __genRunSeq comment in state-and-status.js.
+  const myRun = beginGenerationRun();
+  const stillMine = () => isRunning && isCurrentGenerationRun(myRun);
   loopActive = true;
   loopActiveSince = Date.now();
   isRunning = true;
@@ -76,7 +103,7 @@ async function startGeneration(resumeTabId) {
     let checkRes = null;
     let checkErr = null;
     for (let i = 0; i < 4; i++) {
-      if (!isRunning) break;
+      if (!stillMine()) break;
       try {
         logToExtension('info', 'Background', `checkPage attempt ${i + 1}/4 on tab ${currentTabId}...`);
         const res = await withTimeout(
@@ -118,7 +145,7 @@ async function startGeneration(resumeTabId) {
     const delay = (data.delay || 1) * 1000; // Faster default delay (1s)
 
     if (currentProvider === 'flow') {
-      await runFlowSequentialGeneration(queue, delay);
+      await runFlowSequentialGeneration(queue, delay, stillMine);
     } else {
       // Generic provider loop (Digen, Gentube, Meta AI, Grok, ...).
       // Same guarantees as Flow: NEVER FAIL (infinite, immediate retry until media
@@ -130,12 +157,12 @@ async function startGeneration(resumeTabId) {
       const GENERIC_GAP_MS = 0;       // no spacing between successful prompts
       const isGrok = currentProvider === 'grok';
 
-      for (let i = 0; i < queue.length && isRunning; i++) {
+      for (let i = 0; i < queue.length && stillMine(); i++) {
         if (queue[i].status === 'completed') continue;
 
         // Honor Pause without losing our place in the queue.
         await waitWhilePaused();
-        if (!isRunning) break;
+        if (!stillMine()) break;
 
         // Mark current item as processing.
         queue[i].status = 'processing';
@@ -146,9 +173,12 @@ async function startGeneration(resumeTabId) {
         let succeeded = false;
         let fatalDisconnect = false;
 
-        while (attempt <= MAX_RETRIES && isRunning && !succeeded) {
+        while (attempt <= MAX_RETRIES && stillMine() && !succeeded) {
           try {
+            if (!stillMine()) break; // superseded between the while-check and here
+
             await ensureTabContentScript(currentTabId);
+            if (!stillMine()) break; // don't submit on behalf of a dead run
 
             // Ask the content script to generate for this prompt.
             // Register a fallback waiter FIRST: long generations can outlive the
@@ -179,6 +209,16 @@ async function startGeneration(resumeTabId) {
 
             if (!response || !response.success) {
               throw new Error(response?.error || 'Generation failed');
+            }
+
+            // This response may have taken a long time to arrive (up to the
+            // full per-attempt timeout). If a newer run has started in the
+            // meantime, this run is stale — discard the result instead of
+            // writing it into a queue/pipeline record that no longer belongs
+            // to us, and stop touching the tab immediately.
+            if (!stillMine()) {
+              logToExtension('warn', 'Background', `Discarding a late result for item ${queue[i].id} — this generation run was superseded by a newer run.`);
+              return;
             }
 
             // Save whatever media came back.
@@ -301,7 +341,7 @@ async function startGeneration(resumeTabId) {
 
         // Move to the next prompt the instant this one's media is captured.
         const hasMorePending = queue.slice(i + 1).some(item => item.status !== 'completed');
-        if (hasMorePending && isRunning && GENERIC_GAP_MS > 0) {
+        if (hasMorePending && stillMine() && GENERIC_GAP_MS > 0) {
           await sleep(GENERIC_GAP_MS);
         }
       }
@@ -339,7 +379,10 @@ async function startGeneration(resumeTabId) {
   }
 }
 
-async function runFlowSequentialGeneration(queue, delay) {
+async function runFlowSequentialGeneration(queue, delay, stillMine) {
+  // Fallback in case this is ever invoked without a run token (shouldn't
+  // happen via startGeneration, but keeps old behavior instead of crashing).
+  if (typeof stillMine !== 'function') stillMine = () => isRunning;
   // Inject prompts into the Flow project ONE BY ONE (line by line). For each
   // prompt we type it into the composer, click generate, and wait until the
   // image is actually captured. The INSTANT the image is fetched we move on to
@@ -361,16 +404,16 @@ async function runFlowSequentialGeneration(queue, delay) {
   // the pipeline's separate 300s timeout eventually gave up on its own. Now a
   // real failure reason surfaces (via logToExtension) after a handful of
   // quick attempts instead of hanging silently for the full 5 minutes.
-  const MAX_RETRIES = 8;
-  const RETRY_BACKOFF_MS = 1500;
+  const MAX_RETRIES = FLOW_MAX_RETRIES;
+  const RETRY_BACKOFF_MS = FLOW_RETRY_BACKOFF_MS;
   const FLOW_GAP_MS = 0;          // no spacing between successful prompts
 
-  for (let i = 0; i < queue.length && isRunning; i++) {
+  for (let i = 0; i < queue.length && stillMine(); i++) {
     if (queue[i].status === 'completed') continue;
 
     // Honor Pause without losing our place in the queue.
     await waitWhilePaused();
-    if (!isRunning) break;
+    if (!stillMine()) break;
 
     // Mark current line as processing
     queue[i].status = 'processing';
@@ -381,9 +424,12 @@ async function runFlowSequentialGeneration(queue, delay) {
     let succeeded = false;
     let fatalDisconnect = false;
 
-    while (attempt <= MAX_RETRIES && isRunning && !succeeded) {
+    while (attempt <= MAX_RETRIES && stillMine() && !succeeded) {
       try {
+        if (!stillMine()) break; // superseded between the while-check and here
+
         await ensureTabContentScript(currentTabId);
+        if (!stillMine()) break; // don't submit a prompt on behalf of a dead run
 
         // Register a fallback waiter FIRST: Flow generations (composer inject +
         // click + up to 120s waiting for the result image) can easily outlive
@@ -394,7 +440,7 @@ async function runFlowSequentialGeneration(queue, delay) {
         // made this loop spin and always burn through the full 300s pipeline
         // timeout. Now we wait for the content script's pushed result instead
         // of resubmitting whenever the error looks like a closed channel.
-        const __flowWaiter = registerResultWaiter(queue[i].id, 180000);
+        const __flowWaiter = registerResultWaiter(queue[i].id, FLOW_PER_ATTEMPT_TIMEOUT_MS);
         let result;
         markLoopProgress('flow_submit');
         logToExtension('info', 'Flow', `Sending flowSubmitPrompt for item ${queue[i].id} (prompt ${i + 1}/${queue.length})...`);
@@ -435,7 +481,7 @@ async function runFlowSequentialGeneration(queue, delay) {
             logToExtension('warn', 'Flow', `flowSubmitPrompt send failed (${smsg}); reinjecting content script and retrying once...`);
             await ensureTabContentScript(currentTabId, true);
             await sleep(400);
-            const __flowWaiter2 = registerResultWaiter(queue[i].id, 180000);
+            const __flowWaiter2 = registerResultWaiter(queue[i].id, FLOW_PER_ATTEMPT_TIMEOUT_MS);
             markLoopProgress('flow_submit_retry');
             try {
               result = await Promise.race([
@@ -467,6 +513,18 @@ async function runFlowSequentialGeneration(queue, delay) {
               }
             }
           }
+        }
+
+        // The result above may have taken up to FLOW_PER_ATTEMPT_TIMEOUT_MS
+        // (180s) to arrive. If a newer run has started in the meantime (user
+        // hit stop then the pipeline restarted this same record under a new
+        // itemId), this run is now stale. Discard the result and stop
+        // touching the tab immediately instead of racing the new run for
+        // the composer/generate button — THIS is the fix for prompts being
+        // resubmitted endlessly and images never getting captured/downloaded.
+        if (!stillMine()) {
+          logToExtension('warn', 'Flow', `Discarding a late result for item ${queue[i].id} — this generation run was superseded by a newer run.`);
+          return;
         }
 
         // Collect captured images (Flow x2 / x4 produce multiple per prompt).
@@ -571,7 +629,7 @@ async function runFlowSequentialGeneration(queue, delay) {
 
     // Move to the next prompt the instant this one's image is captured.
     const hasMorePending = queue.slice(i + 1).some(item => item.status !== 'completed');
-    if (hasMorePending && isRunning && FLOW_GAP_MS > 0) {
+    if (hasMorePending && stillMine() && FLOW_GAP_MS > 0) {
       await sleep(FLOW_GAP_MS);
     }
   }

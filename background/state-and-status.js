@@ -14,6 +14,40 @@ let loopActiveSince = null; // timestamp loopActive last flipped true — lets u
 let loopPhase = 'idle'; // coarse progress marker for pipeline heartbeat / stall detection
 let loopProgressAt = 0; // Date.now() of last markLoopProgress()
 
+// ── Generation run identity ─────────────────────────────────────────────────
+// isRunning/loopActive are booleans shared by the WHOLE worker, not scoped to
+// one particular run. That used to be enough to gate a NEW run from starting,
+// but it could not stop an OLD run's in-flight promise chain: that chain only
+// re-checks `isRunning` between awaits, and a fast stop+restart flips
+// isRunning back to true before the old chain's current await resolves — so
+// the "stopped" run just keeps going, now indistinguishable from the new run.
+// Two loops then send flowSubmitPrompt to the SAME tab at the same time,
+// fighting over the composer/generate button (this is what caused prompts to
+// be resubmitted endlessly and images to never get captured/downloaded).
+//
+// __genRunSeq is a monotonically increasing token. Every time a run starts
+// OR is forcibly invalidated (stop, stale/stalled recovery), the token is
+// bumped. Each run captures its own token when it starts and must re-check
+// it (not just isRunning) at every checkpoint — if the token has moved on,
+// this run is stale and must stop touching the tab immediately, regardless
+// of what isRunning currently says.
+let __genRunSeq = 0;
+
+/** Bump the run token, invalidating whatever run (if any) currently holds it. */
+function invalidateCurrentGenerationRun() {
+  return ++__genRunSeq;
+}
+
+/** Claim a fresh token for a NEW run that is about to start. */
+function beginGenerationRun() {
+  return ++__genRunSeq;
+}
+
+/** True if `token` still belongs to the current, non-superseded run. */
+function isCurrentGenerationRun(token) {
+  return token === __genRunSeq;
+}
+
 function markLoopProgress(phase) {
   loopPhase = phase || loopPhase;
   loopProgressAt = Date.now();
@@ -33,6 +67,11 @@ function getGenerationStatus() {
 function abortGenerationLoop(reason) {
   const msg = reason || 'unspecified';
   logToExtension('warn', 'Background', `Aborting generation loop (phase=${loopPhase}): ${msg}`);
+  // Invalidate the run token FIRST. This is what actually makes the old
+  // loop stop touching the tab — flipping isRunning alone was not enough,
+  // because a restart could flip it back to true before the old loop's
+  // current await resolved (see the __genRunSeq comment above).
+  invalidateCurrentGenerationRun();
   isRunning = false;
   isPaused = false;
   loopActive = false;
@@ -77,6 +116,10 @@ function tryStartGeneration(resumeTabId) {
   if (isStale || stalled) {
     logToExtension('warn', 'Background',
       `startGeneration: loopActive was stuck (phase=${loopPhase}, age=${Math.round((Date.now() - (loopActiveSince || Date.now())) / 1000)}s, stalledMs=${loopProgressAt ? Date.now() - loopProgressAt : 'n/a'}) — treating as orphaned and recovering.`);
+    // Same reasoning as abortGenerationLoop(): bump the token so the
+    // orphaned run (if it's still technically alive somewhere) can never
+    // again be mistaken for "the current run" once a new one starts.
+    invalidateCurrentGenerationRun();
     isRunning = false;
     loopActive = false;
     loopActiveSince = null;
@@ -94,7 +137,9 @@ globalThis.bulkygenGeneration = {
   tryStart: tryStartGeneration,
   abort: abortGenerationLoop,
   getStatus: getGenerationStatus,
-  markProgress: markLoopProgress
+  markProgress: markLoopProgress,
+  beginRun: beginGenerationRun,
+  isCurrentRun: isCurrentGenerationRun
 };
 
 // When startGeneration() bails out early (no supported tab, checkPage never

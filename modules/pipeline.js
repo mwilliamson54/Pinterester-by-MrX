@@ -271,7 +271,18 @@
         // (no tab / checkPage fail) cannot be delivered into a void and leave
         // us hanging for 300s.
         log()?.info(TAG, `Waiting for generation result for item ${itemId}...`);
-        const resultPromise = _awaitGenerationResult(itemId, 300000);
+        // The Flow provider's own in-place retry loop (background/generation-loop.js)
+        // can legitimately keep retrying a single stuck prompt for several
+        // minutes before giving up or succeeding. This hard deadline is a
+        // last-resort safety net for a truly wedged worker, not the normal
+        // completion path -- it must stay comfortably above that loop's own
+        // full retry envelope (BULKYGEN_FLOW_RETRY_BUDGET_MS, computed in
+        // generation-loop.js from the same constants that loop uses), or we
+        // end up aborting a run that was still legitimately working. A fixed
+        // 300s here was routinely shorter than that envelope and caused
+        // premature "Generation timeout" failures / loopActive collisions.
+        const generationTimeoutMs = Math.max(300000, globalThis.BULKYGEN_FLOW_RETRY_BUDGET_MS || 0);
+        const resultPromise = _awaitGenerationResult(itemId, generationTimeoutMs);
 
         // Prefer in-process start (same service worker) — avoids unreliable
         // chrome.runtime.sendMessage self-calls that can resolve to null/undefined
@@ -351,68 +362,118 @@
         // metadataEnabled in global settings gates this stage. Per-record fields override globals.
         // Supported for JPEG (EXIF/XMP via APP1 markers), PNG (tEXt/iTXt + eXIf
         // chunks), and WebP (RIFF EXIF/XMP chunks) — same metadata fields either way.
+        //
+        // Policy: if the record supplied metadata fields, metadata is a hard
+        // requirement — it must always end up on the image. The size cap is a
+        // soft target: when embedding pushes the file over it, we recompress
+        // the ORIGINAL image tighter and re-embed, repeating a bounded number
+        // of times. Only if it's still over the cap after every recompression
+        // attempt do we accept the overage and ship the file WITH metadata
+        // anyway — we never silently drop metadata to satisfy the size cap.
         const metaEnabled = record.metadataEnabled === true ? true : (settings.metadataEnabled !== false);
         let finalDataUrl = processed.dataUrl;
         let metadataWritten = false;
         const finalMime = (finalDataUrl && finalDataUrl.match(/^data:([^;]+);/)?.[1]) || '';
         const metadataSupportedForFormat = finalMime === 'image/jpeg' || finalMime === 'image/png' || finalMime === 'image/webp';
         if (metaEnabled && meta()?.isSupported() && finalDataUrl && metadataSupportedForFormat) {
-            try {
-                const sourceBlob = dataUrlToBlob(finalDataUrl);
-                const metadataToEmbed = {
-                    schema_version: 1,
-                    seo: {
-                        title: record.title || settings.metadataTitle,
-                        description: record.description || settings.metadataDescription,
-                        keywords: (() => {
-                            const raw = record.keywords || settings.metadataKeywords || '';
-                            return typeof raw === 'string' ? raw.split(',').map(s => s.trim()).filter(Boolean) : raw;
-                        })()
-                    },
-                    rights: {
-                        creator: record.author || settings.metadataAuthor,
-                        copyright_notice: record.copyright || settings.metadataCopyright,
-                        website: record.website || settings.metadataWebsite
-                    },
-                    generation: {
-                        software: '',
-                        generator: '1',
-                        image_id: record.id,
-                        prompt_id: record.id
-                    },
-                    processing: {
-                        processing_hash: processingHash
-                    },
-                    dates: {
-                        created_at: new Date().toISOString()
-                    }
-                };
-                const embedResult = await meta().embedMetadata(sourceBlob, metadataToEmbed, {
-                    width: processed.width,
-                    height: processed.height
-                });
-                const embeddedBlob = embedResult.blob;
+            const metadataToEmbed = {
+                schema_version: 1,
+                seo: {
+                    title: record.title || settings.metadataTitle,
+                    description: record.description || settings.metadataDescription,
+                    keywords: (() => {
+                        const raw = record.keywords || settings.metadataKeywords || '';
+                        return typeof raw === 'string' ? raw.split(',').map(s => s.trim()).filter(Boolean) : raw;
+                    })()
+                },
+                rights: {
+                    creator: record.author || settings.metadataAuthor,
+                    copyright_notice: record.copyright || settings.metadataCopyright,
+                    website: record.website || settings.metadataWebsite
+                },
+                generation: {
+                    software: '',
+                    generator: '1',
+                    image_id: record.id,
+                    prompt_id: record.id
+                },
+                processing: {
+                    processing_hash: processingHash
+                },
+                dates: {
+                    created_at: new Date().toISOString()
+                }
+            };
+
+            const MAX_EMBED_ATTEMPTS = 4;
+            // Start from the same pre-headroom target buildImageProcessingCfg
+            // already computed; each failed attempt shrinks it further.
+            let recompressTargetKB = processingCfg.maxSizeKB;
+            let candidateDataUrl = finalDataUrl;
+            let candidateWidth = processed.width;
+            let candidateHeight = processed.height;
+
+            for (let attempt = 1; attempt <= MAX_EMBED_ATTEMPTS; attempt++) {
+                let embedResult;
+                try {
+                    const sourceBlob = dataUrlToBlob(candidateDataUrl);
+                    embedResult = await meta().embedMetadata(sourceBlob, metadataToEmbed, {
+                        width: candidateWidth,
+                        height: candidateHeight
+                    });
+                } catch (err) {
+                    log()?.error(TAG, `Metadata embedding failure: ${err.message}`);
+                    break;
+                }
 
                 if (!embedResult.embedded) {
                     // Every layer under this fails soft (missing serializer,
                     // unsupported dimensions, internal error) and hands back
                     // the original blob rather than throwing -- so this is
                     // the ONLY reliable signal that nothing was actually
-                    // written. Leaving metadataWritten false here is what
-                    // makes the output field trustworthy.
+                    // written. Retrying compression can't fix this class of
+                    // failure, so stop here rather than burn more attempts.
                     log()?.warn(TAG, `Metadata was not embedded: ${embedResult.reason || 'unknown reason'}`);
-                } else if (processingCfg.requestedMaxSizeKB && embeddedBlob.size > processingCfg.requestedMaxSizeKB * 1024) {
-                    // Metadata embedding happens AFTER compression, so it can push
-                    // a file that was right at the requested size cap over the
-                    // top. The size limit is a hard requirement, so if embedding
-                    // broke it, keep the compressed-but-unlabeled version instead.
-                    log()?.warn(TAG, `Metadata embedding pushed file over the ${processingCfg.requestedMaxSizeKB}KB cap (${Math.round(embeddedBlob.size / 1024)}KB) — keeping compressed image without metadata instead.`);
-                } else {
-                    finalDataUrl = await blobToDataUrl(embeddedBlob);
-                    metadataWritten = true;
+                    break;
                 }
-            } catch (err) {
-                log()?.error(TAG, `Metadata embedding failure: ${err.message}`);
+
+                const embeddedBlob = embedResult.blob;
+                const overCap = processingCfg.requestedMaxSizeKB && embeddedBlob.size > processingCfg.requestedMaxSizeKB * 1024;
+
+                if (!overCap || attempt === MAX_EMBED_ATTEMPTS) {
+                    if (overCap) {
+                        // Still over the cap after every recompression attempt.
+                        // Metadata is the hard requirement -- keep it and accept
+                        // the size overage rather than shipping an unlabeled file.
+                        log()?.warn(TAG, `Metadata embedding still exceeds the ${processingCfg.requestedMaxSizeKB}KB cap after ${attempt} recompression attempt(s) (${Math.round(embeddedBlob.size / 1024)}KB) — keeping metadata and accepting the overage.`);
+                    }
+                    finalDataUrl = await blobToDataUrl(embeddedBlob);
+                    processed.width = candidateWidth;
+                    processed.height = candidateHeight;
+                    metadataWritten = true;
+                    break;
+                }
+
+                // Over cap and attempts remain: recompress the ORIGINAL image
+                // (not the already-embedded one) tighter, leaving a bit more
+                // headroom this time, then loop around to re-embed.
+                const overageKB = (embeddedBlob.size / 1024) - processingCfg.requestedMaxSizeKB;
+                const previousTargetKB = recompressTargetKB || processingCfg.requestedMaxSizeKB;
+                recompressTargetKB = Math.max(1, previousTargetKB - overageKB - 2);
+                log()?.warn(TAG, `Metadata embedding pushed file to ${Math.round(embeddedBlob.size / 1024)}KB (cap ${processingCfg.requestedMaxSizeKB}KB) — recompressing to ~${recompressTargetKB}KB and retrying (attempt ${attempt}/${MAX_EMBED_ATTEMPTS})...`);
+
+                const recompressed = await canvas()?.processImage(imageDataUrl, wm, {
+                    ...processingCfg,
+                    maxSizeKB: recompressTargetKB
+                });
+                if (!recompressed || !recompressed.dataUrl) {
+                    log()?.error(TAG, 'Recompression for metadata headroom failed — keeping compressed image without metadata.');
+                    break;
+                }
+                candidateDataUrl = recompressed.dataUrl;
+                candidateWidth = recompressed.width;
+                candidateHeight = recompressed.height;
+                processed.quality = recompressed.quality !== undefined ? recompressed.quality : processed.quality;
             }
         }
 

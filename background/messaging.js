@@ -33,27 +33,34 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     logToExtension(message.level || 'info', message.tag || 'ContentScript', message.message || '');
     return false;
   } else if (message.action === 'generationResult') {
-    // Content script pushed a finished generation result — this is the
-    // reliable delivery path for long generations whose sendMessage response
-    // channel may have closed (a known MV3 issue). It resolves the LOCAL
-    // waiter that runFlowSequentialGeneration/regenerateSingleItem's own
-    // Promise.race() is awaiting, so the retry-in-place loop can decide what
-    // to do next with this specific sub-attempt.
+    // Content script pushed a finished generation result (reliable delivery
+    // path for long generations whose response channel may have closed).
     //
-    // It must NOT also forward straight to the pipeline. Content.js pushes
-    // this on every single flowSubmitPrompt attempt, success or fail — but
-    // background.js's own loop has an 8-attempt retry budget per record
-    // before it gives up. Forwarding every raw sub-attempt to the pipeline
-    // used to make it declare the whole record failed after just the FIRST
-    // sub-attempt (while background.js was still legitimately retrying),
-    // which made the pipeline start a second, competing attempt on the same
-    // record. That collided with the still-running first attempt
-    // ("startGeneration rejected — loopActive"), which made the pipeline
-    // force-abort a loop that wasn't actually hung — sometimes right as it
-    // was about to succeed, losing an already-captured image. background.js
-    // already calls bulkygenPipeline.deliverGenerationResult() itself at
-    // the right moments (real success, retries exhausted, fatal disconnect)
-    // — that's the only place a record's outcome should be reported from.
+    // IMPORTANT: this fires once per INDIVIDUAL attempt from the content
+    // script (including every failed attempt that Flow's own per-prompt
+    // retry loop in generation-loop.js is about to retry in place, up to
+    // MAX_RETRIES times on the SAME itemId/tab). It must only wake the
+    // in-process attempt waiter (__deliverPushedResult / registerResultWaiter)
+    // that generation-loop.js is racing against for THIS attempt.
+    //
+    // It must NOT also be forwarded straight to bulkygenPipeline here. Doing
+    // so used to let the very first failed attempt (e.g. "no image captured",
+    // or a page unload mid-generation) resolve the pipeline's outer wait
+    // immediately -- while generation-loop.js's own retry loop was still
+    // legitimately retrying the same item. The pipeline would then abandon
+    // the record, mint a brand-new itemId, and call startGeneration again
+    // while the still-active inner loop held loopActive=true, which got
+    // rejected as "loopActive" and forced pipeline to abort the (still
+    // working) inner loop -- producing the exact symptom reported: the same
+    // prompt getting resubmitted over and over and runs failing with
+    // "Generation timeout after 300s" / stuck "loopActive" collisions.
+    //
+    // generation-loop.js already calls bulkygenPipeline.deliverGenerationResult
+    // itself at every point that is actually final for the pipeline: on real
+    // success, once MAX_RETRIES is exhausted, on a fatal content-script
+    // disconnect, and via onGenerationLoopDied() in its finally block if the
+    // whole loop exits unexpectedly. That is the single source of truth for
+    // "this record is done" -- this handler must not race ahead of it.
     try { __deliverPushedResult(message.itemId, message.result); } catch (e) { /* ignore */ }
     return false;
   } else if (message.action === 'startPipeline') {
