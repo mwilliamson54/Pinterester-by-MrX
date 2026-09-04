@@ -42,6 +42,27 @@ if (typeof chrome !== 'undefined' && chrome.alarms && chrome.alarms.onAlarm) {
     try {
       const data = await ext.storage.local.get(['isRunning', 'isPaused', 'genTabId', 'pipelineRunning']);
 
+      // Stall backstop. chrome.alarms is the only mechanism guaranteed to
+      // wake this worker on a schedule -- pipeline.js's own heartbeat
+      // (setInterval) and the generation loop's per-attempt timeouts
+      // (setTimeout) all freeze along with the worker itself when it's
+      // suspended (backgrounded tab, machine sleep, Chrome throttling), and
+      // don't resume until something else wakes the process. Previously
+      // nothing here checked for "loop is still loopActive===true but has
+      // made no progress in a long time" -- so a frozen loop could sit
+      // stalled far longer than pipeline.js's own GENERATING_STALL_MS
+      // (observed: ~1 hour) because the thing meant to catch that had also
+      // frozen. This runs every ~30s regardless, so it's the right place for
+      // an independent stall check to live, as a backstop alongside (not a
+      // replacement for) pipeline.js's own heartbeat.
+      const ALARM_STALL_MS = 4 * 60 * 1000; // matches pipeline.js's GENERATING_STALL_MS
+      if (typeof loopActive !== 'undefined' && loopActive && loopProgressAt &&
+        (Date.now() - loopProgressAt > ALARM_STALL_MS)) {
+        logToExtension('warn', 'Background',
+          `Watchdog: loop stalled in phase="${loopPhase}" for ${Math.round((Date.now() - loopProgressAt) / 1000)}s with no progress — aborting so the pipeline can retry.`);
+        abortGenerationLoop(`watchdog stall detection (phase=${loopPhase})`);
+      }
+
       // Resurrect the autonomous pipeline if the worker was killed mid-run.
       // (bulkygenPipeline.isRunning lives in memory, so after a worker restart
       // it's always false even though pipelineRunning in storage says it should
