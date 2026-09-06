@@ -9,18 +9,18 @@
 // ─────────────────────────────────────────────────────────────────────────
 // Flow tile identity
 // ─────────────────────────────────────────────────────────────────────────
-// Find the tile container for a given result image (Flow tags each result
-// tile with a stable data-tile-id attribute, unlike its buttons/menus). Used
-// to tell genuinely new results apart from old tiles that scroll/virtualize
-// back into view (see NS.shouldRejectFlowTileForRun below).
+// Find the tile container for a given result image. Flow's Angular Material
+// rewrite dropped the old data-tile-id attribute entirely; result tiles are
+// now <flow-grid-tile-container> elements, and the stable per-image id lives
+// directly on the <img> as data-media-id (see getFlowTileId below).
 function findFlowTileContainer(img) {
   // A generic parent is not a safe fallback: it can contain controls for a
   // different tile when Flow virtualizes or reorders the project grid.
-  return img ? img.closest('[data-tile-id]') : null;
+  return img ? img.closest('flow-grid-tile-container') : null;
 }
 
 function getFlowTileId(img) {
-  return findFlowTileContainer(img)?.getAttribute('data-tile-id') || null;
+  return img?.getAttribute?.('data-media-id') || null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -42,12 +42,16 @@ const FLOW_ASPECT_RATIO_ICONS = {
 
 // The settings/model trigger button (shows e.g. "🍌 Nano Banana 2  [icon] 1x")
 // that opens the popover containing Image/Video, aspect ratio, and 1x-4x
-// tabs. Identified by aria-haspopup="menu" plus an <i> icon whose ligature is
-// one of the known aspect-ratio icons, rather than by id/class.
+// tabs. Flow's rewrite to Angular Material dropped the old aria-haspopup="menu"
+// + <i> ligature markup in favor of aria-label="Settings trigger" /
+// class="settings-trigger-button" with a <mat-icon> ligature — match both so
+// this survives either markup.
 function findFlowRatioTriggerButton() {
-  const buttons = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'));
+  const buttons = Array.from(document.querySelectorAll(
+    'button[aria-label="Settings trigger"], button.settings-trigger-button, button[aria-haspopup="menu"]'
+  ));
   for (const btn of buttons) {
-    const icon = Array.from(btn.querySelectorAll('i'))
+    const icon = Array.from(btn.querySelectorAll('mat-icon, i'))
       .find(i => Object.values(FLOW_ASPECT_RATIO_ICONS).includes((i.textContent || '').trim()));
     if (icon) return { button: btn, icon };
   }
@@ -65,17 +69,25 @@ function getFlowCurrentAspectRatio() {
 }
 
 // Inside the OPEN ratio popover, find the tab button for a given ratio
-// (e.g. "16:9"), matched by its own icon ligature.
+// (e.g. "16:9"), matched by its own icon ligature. The Angular Material
+// rewrite renders this as a <flow-toggles aria-label="Aspect ratio"> holding
+// a mat-button-toggle-group of role="radio" buttons inside a CDK overlay
+// pane, rather than the old Radix role="tab" menu — check both shapes.
 function findFlowRatioTabButton(ratio) {
   const iconName = FLOW_ASPECT_RATIO_ICONS[ratio];
   if (!iconName) return null;
-  const menu = document.querySelector('[data-radix-menu-content][data-state="open"]') ||
-    document.querySelector('[role="menu"][data-state="open"]') ||
-    document; // fall back to whole doc in case the open-state attr differs
-  const tabs = Array.from(menu.querySelectorAll('button[role="tab"]'));
-  for (const tab of tabs) {
-    const icon = tab.querySelector('i');
-    if (icon && (icon.textContent || '').trim() === iconName) return tab;
+  const roots = [
+    document.querySelector('flow-toggles[aria-label="Aspect ratio"]'),
+    document.querySelector('[data-radix-menu-content][data-state="open"]'),
+    document.querySelector('[role="menu"][data-state="open"]'),
+    document // fall back to whole doc in case the open-state attr differs
+  ].filter(Boolean);
+  for (const root of roots) {
+    const options = Array.from(root.querySelectorAll('button[role="radio"], button[role="tab"]'));
+    for (const opt of options) {
+      const icon = opt.querySelector('mat-icon, i');
+      if (icon && (icon.textContent || '').trim() === iconName) return opt;
+    }
   }
   return null;
 }
@@ -141,7 +153,8 @@ async function ensureFlowAspectRatio(targetRatio) {
   pressKey(document.body, 'Escape', {});
   await NS.waitUnthrottled(150);
   const stillOpen = trigger.button.getAttribute('aria-expanded') === 'true' ||
-    trigger.button.getAttribute('data-state') === 'open';
+    trigger.button.getAttribute('data-state') === 'open' ||
+    !!document.querySelector('flow-prompt-box-settings');
   if (stillOpen) {
     await forceClickViaBackground(trigger.button);
     await NS.waitUnthrottled(100);
@@ -200,12 +213,12 @@ async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
     }
 
     // "Before" snapshot: capture both loaded image keys AND every
-    // data-tile-id in the DOM. Flow's virtualized grid removes/unloads
+    // data-media-id in the DOM. Flow's virtualized grid removes/unloads
     // <img> elements for tiles scrolled out of view, but keeps the tile
-    // wrapper with its stable data-tile-id attribute in the DOM. If we
+    // wrapper (with the image's stable data-media-id) in the DOM. If we
     // only snapshot loaded images, a scroll mid-generation causes old
     // tiles to lazy-load and appear "new" — associating the wrong image
-    // with this prompt. Snapshotting tile IDs catches those tiles even
+    // with this prompt. Snapshotting media IDs catches those tiles even
     // when their <img> hasn't loaded yet.
     const beforeKeys = new Set();
     const beforeTileIds = new Set();
@@ -220,14 +233,22 @@ async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
       })
       .forEach(el => beforeKeys.add(NS.elementKey(el)));
     for (const k of NS.__capturedResultKeys) beforeKeys.add(k);
-    // Snapshot ALL tile IDs in the DOM — even tiles whose images haven't
+    // Snapshot ALL media IDs in the DOM — even tiles whose images haven't
     // loaded yet (scrolled out of view, placeholder state, etc.). This is
     // the primary defense against scroll-induced lazy-load false positives.
-    document.querySelectorAll('[data-tile-id]').forEach(tile => {
-      const id = tile.getAttribute('data-tile-id');
+    document.querySelectorAll('img[data-media-id]').forEach(img => {
+      const id = img.getAttribute('data-media-id');
       if (id) beforeTileIds.add(id);
     });
     const flowRunIdentity = NS.createFlowRunIdentity(beforeTileIds);
+    // A failed generation renders as a <flow-error-tile> with no img/media-id
+    // at all, so it can't be tracked through the identity guard above. Track
+    // how many error tiles already exist before this run so a NEW one that
+    // appears mid-run can be recognized as this prompt's own failure (see
+    // the fast-fail check inside NS.waitForFlowResults) instead of the
+    // extension sitting through the full timeout and then resubmitting a
+    // duplicate prompt while the failed one may still be settling.
+    const beforeErrorTileCount = document.querySelectorAll('flow-error-tile').length;
 
     // Flag this as OUR scroll, not the user's, before it fires -- otherwise
     // the tile-identity guard above can reject the very tile this submission
@@ -261,7 +282,7 @@ async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
     try {
       const expected = NS.getFlowExpectedCount();
       console.log('BulkyGen Flow: expecting up to ' + expected + ' image(s)');
-      const resultImgs = await NS.waitForFlowResults(beforeKeys, flowRunIdentity, expected, 120000);
+      const resultImgs = await NS.waitForFlowResults(beforeKeys, flowRunIdentity, expected, 120000, beforeErrorTileCount);
       console.log('BulkyGen Flow: detected ' + resultImgs.length + ' new image(s)');
       for (const img of resultImgs) {
         const src = img.currentSrc || img.src || '';

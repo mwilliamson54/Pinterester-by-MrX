@@ -92,23 +92,23 @@ function markFlowProgrammaticScroll(durationMs = 800) {
 
 function rememberFlowTileIds(root) {
   if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
-  const add = (tile) => {
-    const id = tile?.getAttribute?.('data-tile-id');
+  const add = (img) => {
+    const id = img?.getAttribute?.('data-media-id');
     if (!id) return;
     __flowKnownTileIds.add(id);
     if (Date.now() - __flowLastUserScrollAt <= FLOW_SCROLL_GUARD_MS) {
       __flowScrollMountedTileIds.set(id, Date.now());
     }
   };
-  if (root.matches?.('[data-tile-id]')) add(root);
-  root.querySelectorAll?.('[data-tile-id]').forEach(add);
+  if (root.matches?.('img[data-media-id]')) add(root);
+  root.querySelectorAll?.('img[data-media-id]').forEach(add);
 }
 
 function ensureFlowTileIdentityTracker() {
   if (__flowTileTrackerInstalled || NS.PROVIDER !== 'flow') return;
   __flowTileTrackerInstalled = true;
-  document.querySelectorAll('[data-tile-id]').forEach(tile => {
-    const id = tile.getAttribute('data-tile-id');
+  document.querySelectorAll('img[data-media-id]').forEach(img => {
+    const id = img.getAttribute('data-media-id');
     if (id) __flowKnownTileIds.add(id);
   });
   const markPhysicalInput = () => { __flowLastPhysicalScrollInputAt = Date.now(); };
@@ -144,11 +144,11 @@ function createFlowRunIdentity(beforeTileIds) {
 
 function shouldRejectFlowTileForRun(tileId, identity) {
   if (!tileId || !identity) {
-    // DIAGNOSTIC (temporary): if this fires on every candidate image during
-    // a real run, Flow's DOM no longer exposes [data-tile-id] on the result
-    // container and this guard is rejecting every image unconditionally.
+    // If this fires on every candidate image during a real run, Flow's DOM
+    // no longer exposes a data-media-id on the result <img> and this guard
+    // is rejecting every image unconditionally.
     // See NS.getFlowTileId()/NS.findFlowTileContainer() above.
-    NS.clientLog('warn', 'Flow', `Tile identity guard rejected an image: no data-tile-id ancestor found (tileId=${tileId}).`);
+    NS.clientLog('warn', 'Flow', `Tile identity guard rejected an image: no data-media-id found (tileId=${tileId}).`);
     return true; // Never accept an unbound image.
   }
   if (identity.beforeTileIds?.has(tileId)) return true;

@@ -89,7 +89,7 @@ function isFlowGenerating() {
 // flowRunIdentity tracks both tiles present at submission and tiles previously
 // observed by the page-wide ledger. This prevents a virtualized older tile from
 // becoming eligible merely because it mounts after the user scrolls.
-async function waitForFlowResults(beforeKeys, flowRunIdentity, expectedCount = 1, timeoutMs = 120000) {
+async function waitForFlowResults(beforeKeys, flowRunIdentity, expectedCount = 1, timeoutMs = 120000, beforeErrorTileCount = 0) {
   const start = Date.now();
   const found = new Map(); // key -> img element
   let lastChangeAt = Date.now();
@@ -168,6 +168,23 @@ async function waitForFlowResults(beforeKeys, flowRunIdentity, expectedCount = 1
       // likely failed). Return what we actually have rather than hang.
       console.log('BulkyGen Flow: generation idle with ' + found.size + '/' + expectedCount + ' image(s); returning partial batch');
       break;
+    }
+    if (found.size === 0) {
+      // A failed generation renders as a <flow-error-tile> with no img/
+      // data-media-id, so it can never satisfy the identity guard above and
+      // this loop would otherwise sit through the full timeout doing
+      // nothing useful. If a NEW error tile (one that wasn't already in the
+      // grid before this prompt was submitted) shows up once Flow is no
+      // longer generating, treat that as this run's own failure and return
+      // immediately -- this makes the caller's retry happen faster and
+      // reduces the window where a slow-but-succeeding sibling request
+      // could still be resolving when the retry fires.
+      const currentErrorTileCount = document.querySelectorAll('flow-error-tile').length;
+      if (!generating && currentErrorTileCount > beforeErrorTileCount && stableFor > SETTLE_MS) {
+        console.log('BulkyGen Flow: detected a new error tile with 0 images captured; failing fast instead of waiting out the timeout');
+        NS.clientLog('warn', 'Flow', 'A new "Failed to generate" tile appeared for this prompt; returning early instead of waiting the full timeout.');
+        break;
+      }
     }
     // found.size === 0 (or still settling) -> keep waiting until timeout.
     await NS.waitUnthrottled(150);

@@ -62,7 +62,7 @@ async function startGeneration(resumeTabId) {
           console.log(`BulkyGen: Using background tab ${tabId} (${supportedTab.url.slice(0, 60)}...)`);
         } else {
           // 3. No supported page open anywhere — report error and exit
-          const msg = 'No supported generator page found. Please open one of:\n- Flow: https://labs.google/fx/tools/flow/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
+          const msg = 'No supported generator page found. Please open one of:\n- Flow: https://flow.google.com/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
           logToExtension('warn', 'Background', 'startGeneration aborted — no supported tab found. ' + msg.split('\n')[0]);
           notifyPopup('generationError', { message: msg });
           await _reportPipelineStartFailure('No supported generator page found');
@@ -127,7 +127,7 @@ async function startGeneration(resumeTabId) {
       const reason = `checkPage failed: ${checkErr?.message || 'unsupported page'}`;
       logToExtension('warn', 'Background', `startGeneration aborted — checkPage never succeeded on tab ${currentTabId} (${checkErr?.message || 'unknown reason'}).`);
       notifyPopup('generationError', {
-        message: 'Please navigate to a supported page:\n- Flow: https://labs.google/fx/tools/flow/project\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image\n- Meta AI: https://www.meta.ai/media\n- Grok: https://x.com/i/grok'
+        message: 'Please navigate to a supported page:\n- Flow: https://flow.google.com/project\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image\n- Meta AI: https://www.meta.ai/media\n- Grok: https://x.com/i/grok'
       });
       await _reportPipelineStartFailure(reason);
       await _failQueuedItems(reason);

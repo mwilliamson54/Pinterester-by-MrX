@@ -79,7 +79,7 @@ const clearImagesBtn = document.getElementById('clearImagesBtn');
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS (preserved from original)
 // ═══════════════════════════════════════════════════════════════════════════
-const FLOW_PROJECT_URL_PREFIX = 'https://labs.google/fx/tools/flow/project/';
+const FLOW_PROJECT_URL_PREFIX = 'https://flow.google.com/project/';
 const DEFAULT_FLOW_PROJECT_ID = 'b4648891-fbc6-46dc-9b49-fed264641aa7';
 const METAAI_MEDIA_URL = 'https://www.meta.ai/media';
 const GROK_URL = 'https://grok.com/imagine';
@@ -104,8 +104,8 @@ function isSupportedUrl(url) {
 
 function extractFlowProjectId(url) {
   if (!url) return null;
-  const match = url.match(/\/fx\/tools\/flow\/project\/([a-f0-9-]+)/i) ||
-                url.match(/flow\.google\.com\/project\/([a-f0-9-]+)/i);
+  const match = url.match(/\/fx\/tools\/flow\/project\/([a-f0-9-]+)/i)
+    || url.match(/flow\.google\.com\/project\/([a-f0-9-]+)/i);
   return match?.[1] || null;
 }
 
