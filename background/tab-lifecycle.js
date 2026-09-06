@@ -216,8 +216,14 @@ function mainWorldForceClick() {
       el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
       el.dispatchEvent(new PointerEvent('pointerup', { ...p, buttons: 0 }));
       el.dispatchEvent(new MouseEvent('mouseup', base));
+      // NOTE: dispatch exactly ONE click event here. Flow's Angular Material
+      // buttons respond to a plain dispatched 'click' just fine (unlike the
+      // old React app, which needed props.onClick called directly). Also
+      // calling el.click() right after used to fire a SECOND, independent
+      // click on the same button within this same call — which is what was
+      // causing Flow to receive two generate requests for one submission
+      // (one tile succeeds, the sibling one shows "Failed to generate").
       el.dispatchEvent(new MouseEvent('click', base));
-      el.click();
       out.dispatched = true;
     } catch (e) { out.info += ' dispatch err: ' + e.message; }
   } catch (e) {

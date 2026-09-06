@@ -534,8 +534,11 @@ async function realClick(el) {
   await NS.waitUnthrottled(60);
   try { el.dispatchEvent(new PointerEvent('pointerup', { ...pBase, buttons: 0 })); } catch { /* ignore */ }
   try { el.dispatchEvent(new MouseEvent('mouseup', base)); } catch { /* ignore */ }
+  // Dispatch exactly ONE click event — el.click() right after this used to
+  // fire a second, independent click on the same button (see the matching
+  // note in background/tab-lifecycle.js's mainWorldForceClick), which is
+  // what was causing Flow to receive two generate requests per submission.
   try { el.dispatchEvent(new MouseEvent('click', base)); } catch { /* ignore */ }
-  try { el.click(); } catch { /* ignore */ }
 }
 
 // Press a key (with optional modifiers) on a target element
@@ -607,21 +610,39 @@ async function clickFlowGenerate(editor, prompt) {
       NS.markFlowProgrammaticScroll();
       target.scrollIntoView({ behavior: 'instant', block: 'center' });
       await NS.waitUnthrottled(40);
-      // Strongest method: call the button's real React onClick from the main world
+      // Strongest method: a single real click on the button from the main world.
       await forceClickViaBackground(target);
-      await NS.waitUnthrottled(180);
-      if (submitted()) return true;
-      // Fallback: synthetic clicks on the button, topmost element, and inner icon
+      // Patiently poll for submission before escalating. Flow's Angular
+      // change detection + composer clear can take longer than one fixed
+      // wait, and escalating too early means firing MORE clicks on a button
+      // that already registered the first one — which is what was causing
+      // Flow to receive two generate requests for a single submission (one
+      // tile succeeds, the other shows "Failed to generate").
+      let confirmedEarly = false;
+      for (let i = 0; i < 6; i++) {
+        await NS.waitUnthrottled(200);
+        if (submitted()) { confirmedEarly = true; break; }
+      }
+      if (confirmedEarly) return true;
+
+      // Fallback: escalate through ONE click method at a time, checking
+      // submitted() after each, so we stop the instant it registers instead
+      // of unconditionally piling on target + top + inner + Enter + Space.
       const r = target.getBoundingClientRect();
       const top = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
-      await realClick(target);
-      if (top && top !== target) await realClick(top);
       const inner = target.querySelector('i, span, svg');
-      if (inner) await realClick(inner);
-      // Buttons also activate via keyboard when focused
-      try { target.focus(); } catch { /* ignore */ }
-      pressKey(target, 'Enter');
-      pressKey(target, ' ');
+      const fallbackSteps = [
+        () => realClick(target),
+        () => (top && top !== target) ? realClick(top) : null,
+        () => inner ? realClick(inner) : null,
+        () => { try { target.focus(); } catch { /* ignore */ } pressKey(target, 'Enter'); },
+        () => { try { target.focus(); } catch { /* ignore */ } pressKey(target, ' '); }
+      ];
+      for (const step of fallbackSteps) {
+        await step();
+        await NS.waitUnthrottled(200);
+        if (submitted()) return true;
+      }
     }
     await NS.waitUnthrottled(250);
     const curBtn = findFlowSubmitButton(editor);
@@ -678,8 +699,8 @@ function clickElementHard(el) {
   try { el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 })); } catch { /* ignore */ }
   try { el.dispatchEvent(new PointerEvent('pointerup', { ...pBase, buttons: 0 })); } catch { /* ignore */ }
   try { el.dispatchEvent(new MouseEvent('mouseup', base)); } catch { /* ignore */ }
+  // Single click dispatch only — see the note in realClick() above.
   try { el.dispatchEvent(new MouseEvent('click', base)); } catch { /* ignore */ }
-  try { el.click(); } catch { /* ignore */ }
 }
   // ── Exports for other content-script module files ──
   NS.findFlowTileContainer = findFlowTileContainer;
