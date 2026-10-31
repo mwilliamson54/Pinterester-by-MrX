@@ -77,6 +77,7 @@ async function ensureTabContentScript(tabId, force) {
             'content/generation-core.js',
             'content/flow-dom.js',
             'content/flow-capture.js',
+            'content/flow-job.js',
             'content/providers-generate.js',
             'content/media-capture.js',
             'content/unload-guard.js',

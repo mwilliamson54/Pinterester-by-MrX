@@ -209,36 +209,38 @@
         return Math.min(baseMs * Math.pow(2, attempt), maxMs);
     }
 
-    // ── Main pipeline for a single record ───────────────────────────────────────
-
-    /**
-     * Process one Supabase record end-to-end.
-     *
-     * @param {Object} record — normalized record from bulkygenSupabase.normalizeRecord()
-     * @param {Object} settings — current settings snapshot
-     * @returns {Promise<void>}
-     */
-    async function processRecord(record, settings) {
-        const { id, prompt } = record;
-        if (!prompt) {
-            log()?.warn(TAG, `Record ${id} has no prompt — skipping`);
-            await supa()?.markFailed(settings, id, 'No prompt in record');
-            return;
+    // Load images a previous attempt already captured and stored (IndexedDB), so a
+    // failure AFTER generation (compress / metadata / Drive / Supabase) never
+    // causes the prompt to be paid for again.
+    async function _loadStoredImages(itemId) {
+        try {
+            const rows = await globalThis.bulkygenImageStore.getImagesByItemId(itemId);
+            const out = [];
+            for (const r of rows.slice().reverse()) {
+                if (r.blob) out.push({ imageData: await blobToDataUrl(r.blob), meta: r.meta });
+            }
+            return out;
+        } catch (e) {
+            return [];
         }
+    }
 
-        log()?.info(TAG, `Processing record ${id}`, { prompt: prompt.slice(0, 60) });
-        const startMs = Date.now();
-
-        if (_stopFlag) {
-            throw new Error('Pipeline stopped by user');
+    // Stage 2/3: obtain the generated image(s) for a record. Asks the job ledger
+    // first - if the image was already captured on an earlier attempt, Flow is
+    // not touched at all.
+    async function _obtainGeneration(record, settings, id, prompt) {
+        const J = globalThis.bulkygenJobs;
+        if (J) {
+            try { J.configure(await cfg()?.get()); } catch (e) { /* defaults */ }
+            const existing = await J.get(`rec:${id}`);
+            if (existing && existing.captured && existing.itemId) {
+                const imgs = await _loadStoredImages(existing.itemId);
+                if (imgs.length) {
+                    log()?.info(TAG, `Record ${id}: image already captured earlier - resuming from stored copy, NOT regenerating.`);
+                    return { success: true, imageData: imgs[0].imageData, multipleImages: imgs, meta: imgs[0].meta, reused: true };
+                }
+            }
         }
-
-        // ── Stage 1: Record was already atomically claimed (status → 'processing')
-        // by claimPendingRecord() before processRecord() was called, so no separate
-        // markProcessing() call is needed here (that used to be its own request,
-        // which is what created the race condition).
-        await stats()?.setStatus('generating', prompt);
-
         // ── Stage 2: Feed prompt into the existing generation loop ────────────
         // We create a synthetic queue item and inject it directly into chrome.storage.local
         // so the existing background loop's startGeneration() picks it up.
@@ -313,11 +315,49 @@
         }
 
         // ── Stage 3: Wait for image result ─────────────────────────────────────
-        const result = await resultPromise;
+        return await resultPromise;
+    }
+
+    // ── Main pipeline for a single record ───────────────────────────────────────
+
+    /**
+     * Process one Supabase record end-to-end.
+     *
+     * @param {Object} record — normalized record from bulkygenSupabase.normalizeRecord()
+     * @param {Object} settings — current settings snapshot
+     * @returns {Promise<void>}
+     */
+    async function processRecord(record, settings) {
+        const { id, prompt } = record;
+        if (!prompt) {
+            log()?.warn(TAG, `Record ${id} has no prompt — skipping`);
+            await supa()?.markFailed(settings, id, 'No prompt in record');
+            return;
+        }
+
+        log()?.info(TAG, `Processing record ${id}`, { prompt: prompt.slice(0, 60) });
+        const startMs = Date.now();
+
+        if (_stopFlag) {
+            throw new Error('Pipeline stopped by user');
+        }
+
+        // ── Stage 1: Record was already atomically claimed (status → 'processing')
+        // by claimPendingRecord() before processRecord() was called, so no separate
+        // markProcessing() call is needed here (that used to be its own request,
+        // which is what created the race condition).
+        await stats()?.setStatus('generating', prompt);
+
+        // ── Stage 2/3: obtain the image (ledger-guarded; may reuse a stored capture) ──
+        const result = await _obtainGeneration(record, settings, id, prompt);
 
         if (!result || !result.success || (!result.imageData && !(result.multipleImages?.length))) {
             const err = result?.error || 'No image data returned';
-            throw new Error(`Generation failed: ${err}`);
+            const genErr = new Error(`Generation failed: ${err}`);
+            // The ledger already spent or refused the submit budget; retrying the
+            // whole record would only repeat the refusal (or pay again).
+            if (result && result.noRetry) genErr.noRetry = true;
+            throw genErr;
         }
 
         // Collect all images returned (Flow x2/x4 may return multiple)
@@ -333,6 +373,7 @@
         if (!imageDataUrl) throw new Error('imageData is empty');
 
         const processingStartMs = Date.now();
+        try { await globalThis.bulkygenJobs?.setStage(`rec:${id}`, 'processing', 'compress / metadata / upload'); } catch (e) { /* ignore */ }
 
         // ── Stage 4: Strip metadata + compress (stub in Wave 1) ───────────────
         await stats()?.setStatus('uploading', prompt);
@@ -569,6 +610,7 @@
             prompt
         });
         await stats()?.setStatus('completed', prompt);
+        try { await globalThis.bulkygenJobs?.setStage(`rec:${id}`, 'done', `completed in ${Math.round(totalTimeMs / 1000)}s`); } catch (e) { /* ignore */ }
 
         log()?.info(TAG, `Record ${id} completed in ${totalTimeMs}ms`);
 
@@ -611,6 +653,11 @@
 
                 if (_stopFlag) {
                     wasStopped = true;
+                    break;
+                }
+
+                if (err && err.noRetry) {
+                    log()?.warn(TAG, `Record ${record.id}: not retrying - ${err.message}`);
                     break;
                 }
 
@@ -741,6 +788,19 @@
             }
 
             await _processWithRetry(record, settings);
+
+            // Circuit breaker: several jobs in a row that the ledger could not
+            // complete means something systemic (Flow tab, quota, changed page).
+            // Stop pulling more records instead of paying for more failures.
+            const br = globalThis.bulkygenJobs?.breakerStatus?.();
+            if (br && br.tripped) {
+                log()?.error(TAG, `Circuit breaker tripped: ${br.consecutive} consecutive failed jobs (limit ${br.limit}). Pipeline halted; no further prompts will be submitted. Fix the cause and press Start.`);
+                await stats()?.setLastError(`Halted after ${br.consecutive} consecutive failures - check the Flow tab, then Start again`);
+                try { (globalThis.chrome || globalThis.browser)?.runtime?.sendMessage({ action: 'pipelineHalted', reason: 'circuit_breaker', consecutive: br.consecutive }).catch(() => { }); } catch (e) { /* ignore */ }
+                await globalThis.bulkygenJobs.resetBreaker();
+                pipeline.stop();
+                return;
+            }
 
         } catch (err) {
             // "Failed to fetch" here is almost always transient -- most often the

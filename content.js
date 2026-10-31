@@ -36,6 +36,14 @@ window.__BULKYGEN_CS_LOADED__ = true;
 const ext = globalThis.ext || globalThis.browser || globalThis.chrome;
 
 function detectProvider() {
+  // Gemini Canvas tools (e.g. a shared "Bulk Media Generator") run inside a
+  // sandboxed iframe on https://<random>.scf.usercontent.goog. That frame is
+  // usually a blob: document, whose URL has NO hostname -- but its origin
+  // still does -- so check the origin first.
+  try {
+    const originHost = new URL(window.location.origin).hostname.toLowerCase();
+    if (originHost === 'scf.usercontent.goog' || originHost.endsWith('.scf.usercontent.goog')) return 'geminicanvas';
+  } catch { /* fall through to the normal URL checks */ }
   try {
     const url = new URL(window.location.href);
     const host = (url.hostname || '').toLowerCase();
@@ -58,6 +66,7 @@ function detectProvider() {
     if (href.includes('digen.ai')) return 'digen';
     if (href.includes('gentube.app') && href.includes('/create')) return 'gentube';
     if (href.includes('firefly.adobe.com') && href.includes('/generate')) return 'firefly';
+    if (href.includes('.scf.usercontent.goog')) return 'geminicanvas';
     return 'unknown';
   }
 }
@@ -124,7 +133,7 @@ function togglePanel() {
 
 // Pre-create the hidden panel on supported pages for faster first open.
 // (Does not display anything until the user clicks the extension icon.)
-if (PROVIDER !== 'unknown') {
+if (PROVIDER !== 'unknown' && PROVIDER !== 'geminicanvas') {
   try {
     setTimeout(() => {
       try { ensurePanel(); } catch { /* ignore */ }
@@ -406,6 +415,20 @@ const PROVIDERS = {
         'canvas'
       ]
     },
+  },
+  geminicanvas: {
+    id: 'geminicanvas',
+    label: 'Gemini Canvas',
+    // This provider is driven by fixed element ids in content/gemini-canvas.js,
+    // so these are only here to keep the generic helpers happy.
+    selectors: {
+      promptInput: ['#prompt-input', 'textarea'],
+      actionButton: ['#generate-btn', 'button'],
+      imageContainer: ['#image-grid img[src^="data:image"]', '#image-grid img']
+    },
+    actionKeywords: ['generate'],
+    submitViaEnter: false,
+    clickSubmitButton: true
   },
   firefly: {
     id: 'firefly',

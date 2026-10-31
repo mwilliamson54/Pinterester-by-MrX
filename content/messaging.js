@@ -15,7 +15,7 @@
 if (!window.__BULKYGEN_CS_LISTENER__) {
 window.__BULKYGEN_CS_LISTENER__ = true;
 NS.ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'NS.togglePanel') {
+  if (message.action === 'togglePanel' || message.action === 'NS.togglePanel') {
     NS.togglePanel();
     sendResponse({ success: true });
     return false;
@@ -45,7 +45,7 @@ NS.ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async response
   }
 
-  if (message.action === 'NS.generateImage') {
+  if (message.action === 'generateImage' || message.action === 'NS.generateImage') {
     const __genItemId = message.itemId;
     const __pushResult = (result) => {
       // Push the result back independently of the response channel. Long
@@ -77,7 +77,7 @@ NS.ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'flowSubmitPrompt') {
     NS.clientLog('info', 'Flow', `Received flowSubmitPrompt message (itemId=${message.itemId}).`);
-    const __flowItemId = message.itemId;
+    const __flowItemId = message.callId || message.itemId; // waiter key (unique per background call)
     const __pushFlowResult = (result) => {
       // Same reliable delivery path used for NS.generateImage: push the result
       // independently of the sendMessage response channel. Flow generations
@@ -93,7 +93,7 @@ NS.ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } catch (e) { /* ignore */ }
     };
-    NS.submitFlowPrompt(message.prompt, message.itemId, message.aspectRatio)
+    NS.submitFlowPrompt(message.prompt, message.itemId, message.aspectRatio, message.jobKey, message.callId)
       .then(result => {
         __pushFlowResult(result);
         try { sendResponse(result); } catch (e) { /* channel may be closed */ }
@@ -104,6 +104,34 @@ NS.ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try { sendResponse(result); } catch (e) { /* ignore */ }
       });
     return true;
+  }
+
+  if (message.action === 'flowRecoverCapture') {
+    // Capture-only re-scan of the tiles a previous submit created. NEVER clicks
+    // Generate, so it is free to repeat. Same push-result delivery as submit.
+    NS.clientLog('info', 'Flow', `Received flowRecoverCapture (itemId=${message.itemId}).`);
+    const __recItemId = message.callId || message.itemId; // waiter key (unique per background call)
+    const __pushRecResult = (result) => {
+      try {
+        (globalThis.chrome || NS.ext).runtime.sendMessage({
+          action: 'generationResult', itemId: __recItemId, result
+        });
+      } catch (e) { /* ignore */ }
+    };
+    NS.flowRecoverCapture(message.itemId, message.jobKey, message.waitMs, message.callId)
+      .then(result => { __pushRecResult(result); try { sendResponse(result); } catch (e) { /* closed */ } })
+      .catch(error => {
+        const result = { success: false, phase: 'submitted_no_capture', error: error.message };
+        __pushRecResult(result);
+        try { sendResponse(result); } catch (e) { /* ignore */ }
+      });
+    return true;
+  }
+
+  if (message.action === 'flowProbe') {
+    // Read-only snapshot of what the Flow page is doing right now.
+    try { sendResponse(NS.flowProbe()); } catch (e) { sendResponse({ ok: false, error: e.message }); }
+    return false;
   }
 
   if (message.action === 'bgKeepAlive') {

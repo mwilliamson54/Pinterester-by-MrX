@@ -7,8 +7,14 @@
 
 
 // Internal generation logic (renamed from NS.generateImage)
-async function generateImageInternal(prompt, itemId) {
+async function generateImageInternal(prompt, itemId, aspectRatio) {
   console.log('🚀 Starting generation for prompt:', prompt);
+
+  // Gemini Canvas "Bulk Media Generator": fixed-id page, handled by its own
+  // self-contained module (content/gemini-canvas.js).
+  if (NS.PROVIDER === 'geminicanvas') {
+    return NS.generateGeminiCanvasImage(prompt, itemId, aspectRatio);
+  }
 
   NS.logButtonInventoryOnce();
 

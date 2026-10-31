@@ -170,168 +170,10 @@ async function ensureFlowAspectRatio(targetRatio) {
   return { changed: confirmed, reason: confirmed ? 'ok' : 'unconfirmed' };
 }
 
-async function submitFlowPrompt(prompt, itemId, aspectRatio) {
-  return NS.runExclusiveGeneration(() => submitFlowPromptInternal(prompt, itemId, aspectRatio));
-}
-
-async function submitFlowPromptInternal(prompt, itemId, aspectRatio) {
-  if (NS.PROVIDER !== 'flow') {
-    NS.clientLog('error', 'Flow', `submitFlowPrompt called but detected provider is "${NS.PROVIDER}", not "flow" — the page BulkyGen is running on doesn't match a Flow project URL.`);
-    throw new Error('Flow submit requested on non-Flow page');
-  }
-
-  NS.ensureKeepAlive();
-  NS.activeGenerationItemId = itemId || null;
-
-  try {
-    console.log('BulkyGen Flow: submitFlowPrompt called, prompt:', prompt.substring(0, 40) + '...');
-    NS.clientLog('info', 'Flow', `submitFlowPrompt called for "${prompt.substring(0, 60)}..."`);
-
-    const uiReady = await NS.waitForProviderUI();
-    if (!uiReady) {
-      NS.clientLog('warn', 'Flow', 'NS.waitForProviderUI() reported not ready (no prompt textarea detected on the page).');
-      throw new Error('Flow UI not ready. Make sure the prompt field is visible on the page.');
-    }
-
-    const editor = findFlowComposer();
-    if (!editor) {
-      NS.clientLog('error', 'Flow', 'Could not find the Flow prompt box (findFlowComposer() found no visible contenteditable/textarea) — nothing was typed. Flow\'s composer markup may have changed.');
-      throw new Error('Could not find the Flow prompt box');
-    }
-    console.log('BulkyGen Flow: Found composer', editor.tagName, editor.className);
-
-    // --- Make sure the requested aspect ratio is selected BEFORE we type the
-    // prompt (this can open/close a popover and briefly steal focus, so do it
-    // first rather than after the composer already has text in it) ---
-    if (aspectRatio) {
-      try {
-        await ensureFlowAspectRatio(aspectRatio);
-      } catch (e) {
-        console.warn('BulkyGen Flow: ensureFlowAspectRatio threw:', e?.message || e);
-        NS.clientLog('warn', 'Flow', `Aspect ratio selection failed: ${e?.message || e}`);
-      }
-    }
-
-    // "Before" snapshot: capture both loaded image keys AND every
-    // data-media-id in the DOM. Flow's virtualized grid removes/unloads
-    // <img> elements for tiles scrolled out of view, but keeps the tile
-    // wrapper (with the image's stable data-media-id) in the DOM. If we
-    // only snapshot loaded images, a scroll mid-generation causes old
-    // tiles to lazy-load and appear "new" — associating the wrong image
-    // with this prompt. Snapshotting media IDs catches those tiles even
-    // when their <img> hasn't loaded yet.
-    const beforeKeys = new Set();
-    const beforeTileIds = new Set();
-    NS.collectResultElements()
-      .filter(el => {
-        if (el.tagName !== 'IMG') return false;
-        const src = el.currentSrc || el.src || '';
-        if (!src || !el.complete) return false;
-        const w = el.naturalWidth || el.width || 0;
-        const h = el.naturalHeight || el.height || 0;
-        return w >= 256 && h >= 256;
-      })
-      .forEach(el => beforeKeys.add(NS.elementKey(el)));
-    for (const k of NS.__capturedResultKeys) beforeKeys.add(k);
-    // Snapshot ALL media IDs in the DOM — even tiles whose images haven't
-    // loaded yet (scrolled out of view, placeholder state, etc.). This is
-    // the primary defense against scroll-induced lazy-load false positives.
-    document.querySelectorAll('img[data-media-id]').forEach(img => {
-      const id = img.getAttribute('data-media-id');
-      if (id) beforeTileIds.add(id);
-    });
-    const flowRunIdentity = NS.createFlowRunIdentity(beforeTileIds);
-    // A failed generation renders as a <flow-error-tile> with no img/media-id
-    // at all, so it can't be tracked through the identity guard above. Track
-    // how many error tiles already exist before this run so a NEW one that
-    // appears mid-run can be recognized as this prompt's own failure (see
-    // the fast-fail check inside NS.waitForFlowResults) instead of the
-    // extension sitting through the full timeout and then resubmitting a
-    // duplicate prompt while the failed one may still be settling.
-    const beforeErrorTileCount = document.querySelectorAll('flow-error-tile').length;
-
-    // Flag this as OUR scroll, not the user's, before it fires -- otherwise
-    // the tile-identity guard above can reject the very tile this submission
-    // is about to create (see markFlowProgrammaticScroll() in generation-core.js).
-    NS.markFlowProgrammaticScroll();
-    editor.scrollIntoView({ behavior: 'instant', block: 'center' });
-    await NS.waitUnthrottled(150);
-
-    // --- Inject the prompt and make sure Flow actually registers it ---
-    const injected = await injectFlowPrompt(editor, prompt);
-    console.log('BulkyGen Flow: injected (registered=' + injected.registered + '):', (injected.text || '').substring(0, 60));
-    if (!injected.text) {
-      NS.clientLog('error', 'Flow', 'Failed to inject the prompt into the Flow composer — paste/beforeinput dispatch did not put any text in the editor.');
-      throw new Error('Failed to inject the prompt into the Flow composer');
-    }
-    if (!injected.registered) {
-      NS.clientLog('warn', 'Flow', 'Prompt text was inserted but the generate button never registered as ready (findFlowSubmitButton heuristics may not match the current page markup).');
-    }
-    await NS.waitUnthrottled(250);
-
-    // --- Click the generate (arrow) button once it is enabled ---
-    const submitted = await clickFlowGenerate(editor, prompt);
-    console.log('BulkyGen Flow: submitted =', submitted);
-    if (!submitted) {
-      NS.clientLog('warn', 'Flow', 'clickFlowGenerate() did not confirm the generate button was clicked.');
-    }
-
-    // --- Wait for ALL generated images and capture them (x2 / x4 -> multiple) ---
-    const images = [];
-    const meta = { provider: 'flow', itemId: itemId ?? null, type: 'image' };
-    try {
-      const expected = NS.getFlowExpectedCount();
-      console.log('BulkyGen Flow: expecting up to ' + expected + ' image(s)');
-      const resultImgs = await NS.waitForFlowResults(beforeKeys, flowRunIdentity, expected, 120000, beforeErrorTileCount);
-      console.log('BulkyGen Flow: detected ' + resultImgs.length + ' new image(s)');
-      for (const img of resultImgs) {
-        const src = img.currentSrc || img.src || '';
-        if (!src) continue;
-        try {
-          const data = await NS.getImageAsBase64(src, img);
-
-          if (data) {
-            if (NS.__capturedDataUrls.has(data)) {
-              console.log('BulkyGen Flow: skipping duplicate of an already-captured image');
-              continue;
-            }
-            NS.__capturedResultKeys.add(NS.elementKey(img));
-            NS.__capturedResultSrcs.add(src);
-            NS.__capturedDataUrls.add(data);
-            images.push({
-              imageData: data,
-              meta: {
-                ...meta,
-                src,
-                width: img.naturalWidth || img.width || 0,
-                height: img.naturalHeight || img.height || 0
-              }
-            });
-          }
-        } catch (capErr) {
-          console.log('BulkyGen Flow: image capture failed:', capErr.message);
-        }
-      }
-      if (resultImgs.length === 0) {
-        console.log('BulkyGen Flow: no new image detected in time (prompt was still submitted)');
-        NS.clientLog('warn', 'Flow', 'No new image detected within the timeout window — prompt was submitted but nothing was captured. Check the "Tile identity guard rejected" warnings above: if present for every candidate, Flow\'s DOM markup for result tiles has likely changed (missing/renamed data-tile-id).');
-      }
-    } catch (waitErr) {
-      console.log('BulkyGen Flow: result wait error:', waitErr.message);
-    }
-
-    return {
-      success: true,
-      imageData: images.length ? images[0].imageData : null,
-      multipleImages: images,
-      itemId: itemId ?? null,
-      meta: { ...meta, captured: images.length, submitted: submitted, registered: injected.registered }
-    };
-  } finally {
-    NS.activeGenerationItemId = null;
-    NS.releaseKeepAlive();
-  }
-}
+// NOTE: the submit / capture / recover state machine that used to live here
+// (submitFlowPromptInternal) moved to content/flow-job.js. It needs the helpers
+// below (composer, inject, click, ratio) which are exported at the bottom of
+// this file.
 
 // Locate the Google Flow Slate.js composer (contenteditable, not a textarea)
 function findFlowComposer() {
@@ -573,8 +415,19 @@ async function forceClickViaBackground(btn) {
 }
 
 
-// Wait for the generate button to be enabled, then click it; verify submission
-async function clickFlowGenerate(editor, prompt) {
+// Wait for the generate button to be enabled, then click it; verify submission.
+//
+// Returns { submitted, clicked, by, blocked?, reason? }
+//   clicked    true once ANY real click/keypress was dispatched (the job may now
+//              have been charged, even if we could not see the receipt)
+//   submitted  true only when we saw positive evidence Flow accepted it
+//   by         which evidence matched (composer_cleared / button_disabled /
+//              tile_added / image_added / error_tile_added)
+//
+// `gate` (optional) is awaited right before the FIRST click. It is the
+// write-ahead credit guard: it asks the background job ledger for permission
+// and may veto the click.
+async function clickFlowGenerate(editor, prompt, gate) {
   let btn = findFlowSubmitButton(editor);
   for (let i = 0; i < 25 && !isFlowButtonReady(btn); i++) {
     await NS.waitUnthrottled(200);
@@ -582,24 +435,43 @@ async function clickFlowGenerate(editor, prompt) {
   }
   if (!btn) {
     console.log('BulkyGen Flow: generate button NOT found');
-    return false;
+    return { submitted: false, clicked: false, by: '', reason: 'generate button not found' };
   }
   console.log('BulkyGen Flow: generate button =>', describeEl(btn));
 
   const probe = prompt.trim().substring(0, Math.min(12, prompt.trim().length));
   const promptText = () => (editor.innerText || editor.textContent || '').trim();
   const hadPrompt = !!probe && promptText().includes(probe);
-  const baseImgCount = NS.collectResultElements().filter(el => el.tagName === 'IMG').length;
+  const countImgs = () => NS.collectResultElements().filter(el => el.tagName === 'IMG').length;
+  const countTiles = () => document.querySelectorAll('flow-grid-tile-container').length;
+  const countErrs = () => document.querySelectorAll('flow-error-tile').length;
+  const baseImgCount = countImgs();
+  const baseTileCount = countTiles();
+  const baseErrCount = countErrs();
 
-  // Submission succeeded if: prompt cleared, OR button became disabled (processing),
-  // OR a new image/skeleton tile appeared.
-  const submitted = () => {
+  // Evidence that Flow accepted the submission. Several independent signals,
+  // checked in order of reliability. Returns the name of the first that matches.
+  const submittedBy = () => {
     const stillThere = !!probe && promptText().includes(probe);
+    if (hadPrompt && !stillThere) return 'composer_cleared';
     const cur = findFlowSubmitButton(editor);
-    const ariaNow = cur ? cur.getAttribute('aria-disabled') : null;
-    const imgNow = NS.collectResultElements().filter(el => el.tagName === 'IMG').length;
-    return (hadPrompt && !stillThere) || ariaNow === 'true' || imgNow > baseImgCount;
+    if (cur && cur.getAttribute('aria-disabled') === 'true') return 'button_disabled';
+    if (countTiles() > baseTileCount) return 'tile_added';
+    if (countImgs() > baseImgCount) return 'image_added';
+    if (countErrs() > baseErrCount) return 'error_tile_added';
+    return '';
   };
+
+  let clicked = false;
+  const result = (by) => ({ submitted: !!by, clicked, by: by || '' });
+
+  // Credit guard: last possible moment before anything is clicked.
+  if (typeof gate === 'function') {
+    const verdict = await gate();
+    if (!verdict || verdict.allowed === false) {
+      return { submitted: false, clicked: false, by: '', blocked: true, reason: (verdict && verdict.reason) || 'submit not authorized' };
+    }
+  }
 
   // Give Slate/React a moment to fully wire the enabled button
   await NS.waitUnthrottled(80);
@@ -611,23 +483,21 @@ async function clickFlowGenerate(editor, prompt) {
       target.scrollIntoView({ behavior: 'instant', block: 'center' });
       await NS.waitUnthrottled(40);
       // Strongest method: a single real click on the button from the main world.
+      clicked = true;
       await forceClickViaBackground(target);
-      // Patiently poll for submission before escalating. Flow's Angular
-      // change detection + composer clear can take longer than one fixed
-      // wait, and escalating too early means firing MORE clicks on a button
-      // that already registered the first one — which is what was causing
-      // Flow to receive two generate requests for a single submission (one
-      // tile succeeds, the other shows "Failed to generate").
-      let confirmedEarly = false;
-      for (let i = 0; i < 6; i++) {
+      // Patiently poll (~4s) for the receipt before escalating. Every extra
+      // click on a button that already registered the first one can create a
+      // second, separately charged generation, so escalating too early is the
+      // expensive mistake. Flow's Angular change detection + composer clear can
+      // easily take longer than one fixed short wait.
+      for (let i = 0; i < 20; i++) {
         await NS.waitUnthrottled(200);
-        if (submitted()) { confirmedEarly = true; break; }
+        const by = submittedBy();
+        if (by) return result(by);
       }
-      if (confirmedEarly) return true;
 
-      // Fallback: escalate through ONE click method at a time, checking
-      // submitted() after each, so we stop the instant it registers instead
-      // of unconditionally piling on target + top + inner + Enter + Space.
+      // Fallback: escalate through ONE click method at a time, checking for a
+      // receipt after each, so we stop the instant it registers.
       const r = target.getBoundingClientRect();
       const top = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
       const inner = target.querySelector('i, span, svg');
@@ -640,8 +510,9 @@ async function clickFlowGenerate(editor, prompt) {
       ];
       for (const step of fallbackSteps) {
         await step();
-        await NS.waitUnthrottled(200);
-        if (submitted()) return true;
+        await NS.waitUnthrottled(400);
+        const by = submittedBy();
+        if (by) return result(by);
       }
     }
     await NS.waitUnthrottled(250);
@@ -650,24 +521,25 @@ async function clickFlowGenerate(editor, prompt) {
       ' -> connected=' + (target ? document.contains(target) : 'n/a') +
       ' aria=' + (curBtn ? curBtn.getAttribute('aria-disabled') : 'n/a') +
       ' promptStillThere=' + (!!probe && promptText().includes(probe)));
-    if (submitted()) return true;
+    const by = submittedBy();
+    if (by) return result(by);
     await NS.waitUnthrottled(150);
   }
 
   // Last resort: keyboard submit inside the editor (plain, Ctrl+Enter, Cmd+Enter)
   editor.focus();
+  clicked = true;
   pressKey(editor, 'Enter');
   await NS.waitUnthrottled(400);
-  if (submitted()) return true;
+  let by = submittedBy();
+  if (by) return result(by);
   pressKey(editor, 'Enter', { ctrlKey: true });
   await NS.waitUnthrottled(400);
-  if (submitted()) return true;
+  by = submittedBy();
+  if (by) return result(by);
   pressKey(editor, 'Enter', { metaKey: true });
   await NS.waitUnthrottled(500);
-  console.log('BulkyGen Flow: final -> aria=' +
-    ((findFlowSubmitButton(editor) || {}).getAttribute ? findFlowSubmitButton(editor).getAttribute('aria-disabled') : 'n/a') +
-    ' promptStillThere=' + (!!probe && promptText().includes(probe)));
-  return submitted();
+  return result(submittedBy());
 }
 
 // Describe an element for diagnostics
@@ -705,5 +577,10 @@ function clickElementHard(el) {
   // ── Exports for other content-script module files ──
   NS.findFlowTileContainer = findFlowTileContainer;
   NS.getFlowTileId = getFlowTileId;
-  NS.submitFlowPrompt = submitFlowPrompt;
+  NS.findFlowComposer = findFlowComposer;
+  NS.injectFlowPrompt = injectFlowPrompt;
+  NS.clickFlowGenerate = clickFlowGenerate;
+  NS.ensureFlowAspectRatio = ensureFlowAspectRatio;
+  NS.findFlowSubmitButton = findFlowSubmitButton;
+  NS.isFlowButtonReady = isFlowButtonReady;
 })();

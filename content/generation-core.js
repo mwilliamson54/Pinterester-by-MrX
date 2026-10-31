@@ -188,13 +188,13 @@ function releaseKeepAlive() {
   }
 }
 
-async function generateImage(prompt, itemId) {
+async function generateImage(prompt, itemId, aspectRatio) {
   return runExclusiveGeneration(async () => {
     // Start background keep-alive to prevent tab throttle
     ensureKeepAlive();
     NS.activeGenerationItemId = itemId || null;
     try {
-      return await NS.generateImageInternal(prompt, itemId);
+      return await NS.generateImageInternal(prompt, itemId, aspectRatio);
     } finally {
       NS.activeGenerationItemId = null;
       releaseKeepAlive();

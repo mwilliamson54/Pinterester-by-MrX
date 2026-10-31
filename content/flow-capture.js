@@ -196,4 +196,5 @@ async function waitForFlowResults(beforeKeys, flowRunIdentity, expectedCount = 1
   // ── Exports for other content-script module files ──
   NS.getFlowExpectedCount = getFlowExpectedCount;
   NS.waitForFlowResults = waitForFlowResults;
+  NS.isFlowGenerating = isFlowGenerating;
 })();

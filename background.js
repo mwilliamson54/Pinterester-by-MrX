@@ -19,6 +19,7 @@ importScripts('modules/metadata/metadata-engine.js');
 importScripts('modules/metadata-writer.js');
 importScripts('modules/googleAuth.js');
 importScripts('modules/googleDrive.js');
+importScripts('modules/job-ledger.js');
 importScripts('modules/pipeline.js');
 
 // --- Split-out modules (see background/*.js) ---
@@ -27,6 +28,7 @@ importScripts('background/keepalive.js');
 importScripts('background/messaging.js');
 importScripts('background/generation-support.js');
 importScripts('background/generation-loop.js');
+importScripts('background/tool-link.js');
 importScripts('background/tab-lifecycle.js');
 importScripts('background/image-export.js');
 

@@ -4,26 +4,35 @@
 // so everything here shares state (isRunning, isPaused, etc.) with them
 // exactly as it did when this was all one file.
 
-// ── Shared Flow retry envelope ───────────────────────────────────────────────
-// runFlowSequentialGeneration() below retries a single stuck prompt up to
-// FLOW_MAX_RETRIES times in place (same itemId, same tab), each attempt
-// bounded by FLOW_PER_ATTEMPT_TIMEOUT_MS with FLOW_RETRY_BACKOFF_MS between
-// tries. modules/pipeline.js's own hard timeout for a record MUST stay
-// comfortably above this full envelope -- otherwise the pipeline gives up
-// and aborts a Flow run that is still legitimately retrying on its own,
-// which is what previously caused records to bounce between "loopActive"
-// rejections and premature "Generation timeout" failures. Exposed on
-// globalThis so pipeline.js (loaded earlier, but this is only read at
-// runtime) can derive its timeout from the same numbers instead of an
-// independent guess that can silently drift out of sync.
-const FLOW_MAX_RETRIES = 8;
+// ── Flow credit-safety envelope ──────────────────────────────────────────────
+// Every Flow prompt is driven by the JOB LEDGER (modules/job-ledger.js), not by
+// a blind retry counter. For each prompt the loop repeatedly asks the ledger
+// "what is allowed next?" and gets exactly one of:
+//
+//   submit   click Generate (costs credits)   - only if it was never submitted,
+//                                               or the previous submission was
+//                                               PROVEN to have failed, and the
+//                                               per-job submit budget is not spent
+//   recover  re-scan the existing result tiles and read the image (free)
+//   reuse    the image is already captured and stored - do not touch Flow
+//   blocked  ambiguous; stop and ask a human (state = needs_attention)
+//
+// "No image captured" is therefore never a reason to click Generate again.
+// The old behaviour (retry = resubmit, up to 9 times per prompt, and unlimited
+// for the other providers) is what burned credits.
+//
+// FLOW_PER_ATTEMPT_TIMEOUT_MS bounds one content-script call (submit incl. the
+// 120s result wait). modules/pipeline.js derives its hard timeout from
+// BULKYGEN_FLOW_RETRY_BUDGET_MS so it can never fire while this loop is still
+// legitimately working through submit -> recover.
 const FLOW_PER_ATTEMPT_TIMEOUT_MS = 180000;
 const FLOW_RETRY_BACKOFF_MS = 1500;
-// x2 headroom covers the "send failed, reinject, retry once" sub-path within
-// a single attempt, which can itself wait out a second full per-attempt
-// timeout before giving up on that attempt.
+const FLOW_UI_FAILURE_LIMIT = 3;     // "could not click" failures (free) before we stop
+const FLOW_TRANSPORT_ERROR_LIMIT = 3; // content script unreachable
 globalThis.BULKYGEN_FLOW_RETRY_BUDGET_MS =
-  (FLOW_MAX_RETRIES + 1) * (FLOW_PER_ATTEMPT_TIMEOUT_MS * 2 + FLOW_RETRY_BACKOFF_MS);
+  2 * (FLOW_PER_ATTEMPT_TIMEOUT_MS + 60000) +   // up to 2 submits
+  3 * (45000 + 30000) +                         // up to 3 capture-only scans
+  60000;                                        // backoff / slack
 
 async function startGeneration(resumeTabId) {
   if (loopActive) return; // a loop is already running in this worker
@@ -143,17 +152,22 @@ async function startGeneration(resumeTabId) {
     const data = await ext.storage.local.get(['queue', 'delay']);
     const queue = data.queue || [];
     const delay = (data.delay || 1) * 1000; // Faster default delay (1s)
+    try {
+      const st = await globalThis.bulkygenSettings?.get?.();
+      globalThis.bulkygenJobs?.configure(st);
+    } catch (e) { /* defaults are fine */ }
+    try { globalThis.bulkygenToolLink?.publishRun('running', { provider: currentProvider, tabId: currentTabId }); } catch (e) { /* ignore */ }
 
     if (currentProvider === 'flow') {
       await runFlowSequentialGeneration(queue, delay, stillMine);
     } else {
-      // Generic provider loop (Digen, Gentube, Meta AI, Grok, ...).
-      // Same guarantees as Flow: NEVER FAIL (infinite, immediate retry until media
-      // is actually captured) and ZERO delay between prompts. Runs in the
+      // Generic provider loop (Digen, Gentube, Meta AI, Grok, ...). Runs in the
       // background no matter which tab is focused (keep-alive + background-safe
-      // waits live in the content script).
-      const MAX_RETRIES = Infinity;   // never give up on a prompt
-      const RETRY_BACKOFF_MS = 0;     // retry instantly
+      // waits live in the content script). Retries are capped (see below).
+      // Bounded: these providers have no receipt/recover logic, so every retry
+      // is a fresh paid submission. Cap it and back off instead of looping.
+      const MAX_RETRIES = 2;
+      const RETRY_BACKOFF_MS = 2000;
       const GENERIC_GAP_MS = 0;       // no spacing between successful prompts
       const isGrok = currentProvider === 'grok';
 
@@ -363,6 +377,7 @@ async function startGeneration(resumeTabId) {
   } finally {
     loopActive = false; loopActiveSince = null;
     markLoopProgress('idle');
+    try { globalThis.bulkygenToolLink?.publishRun('idle', {}); } catch (e) { /* ignore */ }
     // Notify any pipeline waiters that the loop is gone so they fail fast
     // instead of burning their full 300-second timeout with zero activity.
     // This is the single most important escape hatch: if startGeneration exits
@@ -379,260 +394,302 @@ async function startGeneration(resumeTabId) {
   }
 }
 
+// One content-script round trip, keyed by a unique callId so a late/duplicate
+// push from an EARLIER call can never be mistaken for this call's result.
+async function callFlowContent(message, timeoutMs) {
+  const callId = `call-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  message = Object.assign({}, message, { callId });
+  const waiter = registerResultWaiter(callId, timeoutMs);
+  try {
+    return await Promise.race([
+      ext.tabs.sendMessage(currentTabId, message),
+      waiter.promise.then((r) => {
+        if (r == null) throw new Error(`${message.action} timed out waiting for the content script`);
+        return r;
+      })
+    ]);
+  } catch (sendErr) {
+    const smsg = (sendErr && sendErr.message) || String(sendErr);
+    if (/message channel closed|asynchronous response|message port closed/i.test(smsg)) {
+      // Long generations outlive the sendMessage channel in MV3. The content
+      // script also PUSHES its result, so wait for that - never resend.
+      logToExtension('info', 'Flow', `Response channel closed during ${message.action}; awaiting pushed result (no resend)...`);
+      const r = await waiter.promise;
+      if (!r) throw new Error('Result not received after the response channel closed');
+      return r;
+    }
+    throw sendErr;
+  } finally {
+    waiter.cancel();
+  }
+}
+
+async function loadStoredImages(itemId) {
+  try {
+    const rows = await globalThis.bulkygenImageStore.getImagesByItemId(itemId);
+    const out = [];
+    for (const r of rows.slice().reverse()) {
+      if (!r.blob) continue;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onloadend = () => resolve(fr.result);
+        fr.onerror = () => reject(fr.error);
+        fr.readAsDataURL(r.blob);
+      });
+      out.push({ imageData: dataUrl, meta: r.meta });
+    }
+    return out;
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Run ONE Flow prompt to completion under the job ledger.
+ * Returns { ok, images, error, needsAttention, aborted, reused }.
+ * The number of times Generate is clicked is decided by the ledger, not here.
+ */
+async function runFlowJob(item, jobKey, stillMine) {
+  const J = globalThis.bulkygenJobs;
+  const cfg = J.getConfig();
+  let uiFailures = 0;
+  let transportErrors = 0;
+
+  for (let turn = 0; turn < 24 && stillMine(); turn++) {
+    await waitWhilePaused();
+    if (!stillMine()) return { ok: false, aborted: true };
+
+    const job = await J.ensure(jobKey, {
+      prompt: item.prompt, aspectRatio: item.aspectRatio || null, itemId: item.id,
+      source: item._toolJobId ? 'tool' : (item._pipelineRecordId ? 'pipeline' : 'queue')
+    });
+    const d = J.decide(job);
+
+    if (d.action === 'reuse') {
+      const imgs = await loadStoredImages(job.itemId || item.id);
+      if (imgs.length) {
+        logToExtension('info', 'Flow', `Job ${jobKey}: already captured - reusing ${imgs.length} stored image(s), Flow untouched.`);
+        return { ok: true, images: imgs, reused: true };
+      }
+      logToExtension('warn', 'Flow', `Job ${jobKey}: ledger says captured but stored images are gone; releasing so it can be regenerated.`);
+      await J.release(jobKey);
+      continue;
+    }
+
+    if (d.action === 'blocked') {
+      await J.markNeedsAttention(jobKey, d.reason);
+      return { ok: false, needsAttention: true, error: d.reason };
+    }
+
+    let res;
+    try {
+      await ensureTabContentScript(currentTabId);
+      if (!stillMine()) return { ok: false, aborted: true };
+
+      if (d.action === 'recover') {
+        await J.noteRecoverTry(jobKey);
+        markLoopProgress('flow_recover');
+        logToExtension('info', 'Flow', `Job ${jobKey}: ${d.reason} -> capture-only scan (no Generate click).`);
+        res = await callFlowContent({
+          action: 'flowRecoverCapture', itemId: (job.lastSubmit && job.lastSubmit.itemId) || job.itemId || item.id,
+          jobKey, waitMs: cfg.recoverWaitMs
+        }, cfg.recoverWaitMs + 30000);
+      } else {
+        markLoopProgress('flow_submit');
+        logToExtension('info', 'Flow', `Job ${jobKey}: ${d.reason} -> submit (${job.submitCount}/${cfg.maxSubmitsPerJob} used).`);
+        res = await callFlowContent({
+          action: 'flowSubmitPrompt', prompt: item.prompt, itemId: item.id, jobKey,
+          aspectRatio: item.aspectRatio || null
+        }, FLOW_PER_ATTEMPT_TIMEOUT_MS + 60000);
+      }
+      markLoopProgress('flow_result');
+      transportErrors = 0;
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      transportErrors++;
+      logToExtension('warn', 'Flow', `Job ${jobKey}: content call failed (${msg}) [${transportErrors}/${FLOW_TRANSPORT_ERROR_LIMIT}]. The ledger decides what happens next; nothing is blindly resent.`);
+      if (transportErrors >= FLOW_TRANSPORT_ERROR_LIMIT) {
+        const reason = `Flow tab unreachable (${msg}). Refresh the Flow project page.`;
+        await J.markNeedsAttention(jobKey, reason);
+        return { ok: false, needsAttention: true, fatalDisconnect: true, error: reason };
+      }
+      try { await ensureTabContentScript(currentTabId, true); } catch (e) { /* next turn will tell */ }
+      await sleep(FLOW_RETRY_BACKOFF_MS * transportErrors);
+      continue;
+    }
+
+    if (!stillMine()) {
+      logToExtension('warn', 'Flow', `Discarding a late result for job ${jobKey} - this generation run was superseded.`);
+      return { ok: false, aborted: true };
+    }
+
+    // If the page found this job's result tiles, Flow DID accept the prompt,
+    // even when no receipt was seen at click time. Record that so the ledger
+    // never treats a visible result as "maybe it never submitted".
+    if (res && res.submitted && job.lastSubmit && !job.lastSubmit.confirmed) {
+      await J.noteConfirmed(jobKey, res.receiptBy || 'result_seen');
+    }
+
+    // ── interpret what the page reported ────────────────────────────────────
+    const imgs = Array.isArray(res && res.multipleImages) && res.multipleImages.length
+      ? res.multipleImages
+      : (res && res.imageData ? [{ imageData: res.imageData, meta: res.meta }] : []);
+
+    if (res && res.success && imgs.length) {
+      // Drop images already stored for an earlier slot (Flow can re-serve a
+      // previous preview). A duplicate means "not THIS prompt's image" - that
+      // is a capture problem, not a reason to pay for another generation.
+      const fresh = imgs.filter(fi => !isDuplicateCapture(fi.imageData));
+      if (fresh.length === 0) {
+        logToExtension('warn', 'Flow', `Job ${jobKey}: only duplicates of earlier images were captured; re-scanning instead of regenerating.`);
+        await J.noteRecoverTry(jobKey);
+        continue;
+      }
+      let saved = 0;
+      for (let n = 0; n < fresh.length; n++) {
+        const label = fresh.length > 1 ? `${item.prompt} (${n + 1}/${fresh.length})` : item.prompt;
+        for (let tryNo = 0; tryNo < 3; tryNo++) {
+          try {
+            await saveGeneratedImage(fresh[n].imageData, label, item.id, fresh[n].meta);
+            saved++;
+            break;
+          } catch (saveError) {
+            console.error('Flow image save error:', saveError);
+            await sleep(500);
+          }
+        }
+      }
+      if (saved > 0) {
+        await J.markCaptured(jobKey, { imageCount: saved, itemId: item.id });
+      } else {
+        logToExtension('error', 'Flow', `Job ${jobKey}: image captured but could not be saved to local storage; continuing with the in-memory copy.`);
+      }
+      return { ok: true, images: fresh };
+    }
+
+    if (res && res.phase === 'blocked') {
+      // The ledger itself refused the click. Loop once more so decide() routes
+      // to recover/blocked; the turn cap prevents any spin.
+      logToExtension('warn', 'Flow', `Job ${jobKey}: submit refused by ledger (${res.error}).`);
+      continue;
+    }
+
+    if (res && res.provenFailed) {
+      logToExtension('warn', 'Flow', `Job ${jobKey}: Flow showed a failed tile (${res.error}).`);
+      await J.noteProvenFailure(jobKey, res.error);
+      await sleep(FLOW_RETRY_BACKOFF_MS);
+      continue;
+    }
+
+    if (res && res.phase === 'no_context') {
+      const reason = `Cannot recover: ${res.error}`;
+      await J.markNeedsAttention(jobKey, reason);
+      return { ok: false, needsAttention: true, error: reason };
+    }
+
+    if (res && res.phase === 'submit_failed') {
+      // Nothing was clicked (the content script refunded the ledger), so no
+      // credits were spent. Bounded because a broken page would spin forever.
+      uiFailures++;
+      logToExtension('warn', 'Flow', `Job ${jobKey}: could not submit (${res.error}) [${uiFailures}/${FLOW_UI_FAILURE_LIMIT}] - no credits spent.`);
+      if (uiFailures >= FLOW_UI_FAILURE_LIMIT) {
+        await J.markNeedsAttention(jobKey, `Could not drive the Flow page: ${res.error}`);
+        return { ok: false, needsAttention: true, error: `Could not drive the Flow page: ${res.error}` };
+      }
+      await sleep(FLOW_RETRY_BACKOFF_MS * uiFailures);
+      continue;
+    }
+
+    // submitted_no_capture, or an unlabelled failure (e.g. the page unloaded
+    // mid-generation): the ledger knows whether the click happened and decides
+    // between recover / submit / blocked on the next turn.
+    logToExtension('info', 'Flow', `Job ${jobKey}: ${(res && res.error) || 'no result'} - deferring to ledger.`);
+    await sleep(500);
+  }
+
+  if (!stillMine()) return { ok: false, aborted: true };
+  await J.markNeedsAttention(jobKey, 'Job loop guard reached without a result');
+  return { ok: false, needsAttention: true, error: 'Job loop guard reached without a result' };
+}
+
+function flowJobKeyFor(item) {
+  return item && item._pipelineRecordId ? `rec:${item._pipelineRecordId}` : (item && item.id);
+}
+
 async function runFlowSequentialGeneration(queue, delay, stillMine) {
-  // Fallback in case this is ever invoked without a run token (shouldn't
-  // happen via startGeneration, but keeps old behavior instead of crashing).
   if (typeof stillMine !== 'function') stillMine = () => isRunning;
-  // Inject prompts into the Flow project ONE BY ONE (line by line). For each
-  // prompt we type it into the composer, click generate, and wait until the
-  // image is actually captured. The INSTANT the image is fetched we move on to
-  // the next prompt with zero added delay ("lightning fast").
-  //
-  // If a prompt fails (error, timeout, or no image captured) we AUTO-RETRY the
-  // SAME queue slot a few times before giving up, so a transient failure self-
-  // heals without losing its place in the queue.
-  // NEVER FAIL: keep retrying the same prompt until it actually produces an
-  // image. Retries fire IMMEDIATELY (no backoff). The only things that end the
-  // loop are a successful capture or the user pressing Stop (isRunning = false).
-  // Bounded retries with a short gap between attempts. This used to be
-  // Infinity/0ms — an unconditional, zero-delay retry loop. If Flow's page
-  // (composer or generate button) simply couldn't be located, that spun
-  // silently forever: every attempt failed instantly and re-tried instantly,
-  // so nothing was ever typed, no diagnostic ever reached the visible logs
-  // (content-script console.log only appears in the Flow tab's own DevTools,
-  // not the service worker inspector), and the record just sat there until
-  // the pipeline's separate 300s timeout eventually gave up on its own. Now a
-  // real failure reason surfaces (via logToExtension) after a handful of
-  // quick attempts instead of hanging silently for the full 5 minutes.
-  const MAX_RETRIES = FLOW_MAX_RETRIES;
-  const RETRY_BACKOFF_MS = FLOW_RETRY_BACKOFF_MS;
-  const FLOW_GAP_MS = 0;          // no spacing between successful prompts
+  const J = globalThis.bulkygenJobs;
+  if (!J) throw new Error('Job ledger module is not loaded (modules/job-ledger.js)');
 
   for (let i = 0; i < queue.length && stillMine(); i++) {
     if (queue[i].status === 'completed') continue;
 
-    // Honor Pause without losing our place in the queue.
     await waitWhilePaused();
     if (!stillMine()) break;
 
-    // Mark current line as processing
     queue[i].status = 'processing';
     await ext.storage.local.set({ queue, currentIndex: i });
     notifyPopup('updateQueue', { queue });
 
-    let attempt = 0;
-    let succeeded = false;
-    let fatalDisconnect = false;
+    const jobKey = flowJobKeyFor(queue[i]);
+    markLoopProgress('flow_job');
+    const out = await runFlowJob(queue[i], jobKey, stillMine);
 
-    while (attempt <= MAX_RETRIES && stillMine() && !succeeded) {
-      try {
-        if (!stillMine()) break; // superseded between the while-check and here
+    if (out.aborted) {
+      // Superseded or stopped: leave the item as it is; do not report a failure.
+      await ext.storage.local.set({ queue });
+      return;
+    }
 
-        await ensureTabContentScript(currentTabId);
-        if (!stillMine()) break; // don't submit a prompt on behalf of a dead run
-
-        // Register a fallback waiter FIRST: Flow generations (composer inject +
-        // click + up to 120s waiting for the result image) can easily outlive
-        // the sendMessage response channel in MV3. Previously, any channel error
-        // here caused an immediate re-inject-and-resend of the SAME prompt, even
-        // though Flow could still be generating the original one server-side —
-        // that duplicate resubmission (plus the lost original result) is what
-        // made this loop spin and always burn through the full 300s pipeline
-        // timeout. Now we wait for the content script's pushed result instead
-        // of resubmitting whenever the error looks like a closed channel.
-        const __flowWaiter = registerResultWaiter(queue[i].id, FLOW_PER_ATTEMPT_TIMEOUT_MS);
-        let result;
-        markLoopProgress('flow_submit');
-        logToExtension('info', 'Flow', `Sending flowSubmitPrompt for item ${queue[i].id} (prompt ${i + 1}/${queue.length})...`);
+    if (out.ok) {
+      queue[i].status = 'completed';
+      await J.recordOutcome(true);
+      try { globalThis.bulkygenToolLink?.publishResult(queue[i], out.images); } catch (e) { /* ignore */ }
+      if (queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
         try {
-          // Race sendMessage against the pushed-result waiter so a hung response
-          // channel (or a content script that never sendResponse's) cannot block
-          // forever. Content also pushes generationResult independently.
-          result = await Promise.race([
-            ext.tabs.sendMessage(currentTabId, {
-              action: 'flowSubmitPrompt',
-              prompt: queue[i].prompt,
-              itemId: queue[i].id,
-              aspectRatio: queue[i].aspectRatio || null
-            }),
-            __flowWaiter.promise.then((r) => {
-              if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result');
-              return r;
-            })
-          ]);
-          __flowWaiter.cancel();
-          markLoopProgress('flow_result');
-        } catch (sendErr) {
-          const smsg = (sendErr && sendErr.message) || String(sendErr);
-          if (/message channel closed|asynchronous response|message port closed/i.test(smsg)) {
-            console.log(`⏳ flow: response channel closed for prompt ${i + 1}; awaiting pushed result (no regeneration)...`);
-            logToExtension('info', 'Flow', `Response channel closed for prompt ${i + 1}; awaiting pushed result...`);
-            result = await __flowWaiter.promise;
-            if (!result) {
-              throw new Error('Generation result not received after the response channel closed');
-            }
-            markLoopProgress('flow_result');
-          } else if (/timed out waiting for generation result/i.test(smsg)) {
-            __flowWaiter.cancel();
-            throw sendErr;
-          } else {
-            __flowWaiter.cancel();
-            // Content script unreachable -> force re-inject and retry once.
-            logToExtension('warn', 'Flow', `flowSubmitPrompt send failed (${smsg}); reinjecting content script and retrying once...`);
-            await ensureTabContentScript(currentTabId, true);
-            await sleep(400);
-            const __flowWaiter2 = registerResultWaiter(queue[i].id, FLOW_PER_ATTEMPT_TIMEOUT_MS);
-            markLoopProgress('flow_submit_retry');
-            try {
-              result = await Promise.race([
-                ext.tabs.sendMessage(currentTabId, {
-                  action: 'flowSubmitPrompt',
-                  prompt: queue[i].prompt,
-                  itemId: queue[i].id,
-                  aspectRatio: queue[i].aspectRatio || null
-                }),
-                __flowWaiter2.promise.then((r) => {
-                  if (r == null) throw new Error('flowSubmitPrompt timed out waiting for generation result (retry)');
-                  return r;
-                })
-              ]);
-              __flowWaiter2.cancel();
-              markLoopProgress('flow_result');
-            } catch (sendErr2) {
-              const smsg2 = (sendErr2 && sendErr2.message) || String(sendErr2);
-              if (/message channel closed|asynchronous response|message port closed/i.test(smsg2)) {
-                console.log(`⏳ flow: response channel closed for prompt ${i + 1} (retry); awaiting pushed result (no regeneration)...`);
-                result = await __flowWaiter2.promise;
-                if (!result) {
-                  throw new Error('Generation result not received after the response channel closed');
-                }
-                markLoopProgress('flow_result');
-              } else {
-                __flowWaiter2.cancel();
-                throw sendErr2;
-              }
-            }
-          }
-        }
-
-        // The result above may have taken up to FLOW_PER_ATTEMPT_TIMEOUT_MS
-        // (180s) to arrive. If a newer run has started in the meantime (user
-        // hit stop then the pipeline restarted this same record under a new
-        // itemId), this run is now stale. Discard the result and stop
-        // touching the tab immediately instead of racing the new run for
-        // the composer/generate button — THIS is the fix for prompts being
-        // resubmitted endlessly and images never getting captured/downloaded.
-        if (!stillMine()) {
-          logToExtension('warn', 'Flow', `Discarding a late result for item ${queue[i].id} — this generation run was superseded by a newer run.`);
-          return;
-        }
-
-        // Collect captured images (Flow x2 / x4 produce multiple per prompt).
-        const flowImgs = Array.isArray(result?.multipleImages) && result.multipleImages.length
-          ? result.multipleImages
-          : (result?.imageData ? [{ imageData: result.imageData, meta: result.meta }] : []);
-
-        // Treat "no image captured" the same as a failure so it auto-retries.
-        if (!result?.success || flowImgs.length === 0) {
-          throw new Error(result?.error || 'No image captured');
-        }
-
-        // Drop any image already captured for an earlier slot (Flow can re-serve
-        // the prior preview). If NONE are new, fail so we regenerate a genuinely
-        // fresh image for THIS slot.
-        const freshFlowImgs = flowImgs.filter(fi => !isDuplicateCapture(fi.imageData));
-        if (freshFlowImgs.length === 0) {
-          throw new Error('Only a duplicate of an earlier image was captured; regenerating for a fresh result');
-        }
-
-        for (let n = 0; n < freshFlowImgs.length; n++) {
-          try {
-            const label = freshFlowImgs.length > 1
-              ? `${queue[i].prompt} (${n + 1}/${freshFlowImgs.length})`
-              : queue[i].prompt;
-            await saveGeneratedImage(freshFlowImgs[n].imageData, label, queue[i].id, freshFlowImgs[n].meta);
-          } catch (saveError) {
-            console.error('Flow image save error (continuing):', saveError);
-          }
-        }
-
-        queue[i].status = 'completed';
-        succeeded = true;
-
-        // Deliver result to pipeline if this item originated from autonomous mode
-        if (queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
-          try {
-            globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
-              success: true,
-              imageData: freshFlowImgs[0]?.imageData,
-              multipleImages: freshFlowImgs,
-              meta: freshFlowImgs[0]?.meta
-            });
-          } catch (e) { /* ignore */ }
-        }
-      } catch (err) {
-        // A dead content-script connection can't be fixed by retrying the same
-        // tab, so stop the whole run and ask for a refresh.
-        if (err.message && err.message.includes('Could not establish connection')) {
-          fatalDisconnect = true;
-          break;
-        }
-
-        attempt++;
-        if (attempt > MAX_RETRIES) {
-          queue[i].status = 'error';
-          logToExtension('warn', 'Flow', `Prompt ${i + 1} failed after ${MAX_RETRIES + 1} tries: ${err.message}`);
-          notifyPopup('generationError', {
-            message: `Flow prompt ${i + 1} failed after ${MAX_RETRIES + 1} tries: ${err.message}`
+          globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
+            success: true,
+            imageData: out.images[0] && out.images[0].imageData,
+            multipleImages: out.images,
+            meta: out.images[0] && out.images[0].meta,
+            reused: !!out.reused
           });
-          // Report failure to the pipeline right away instead of leaving it to
-          // burn out its own separate 300s wait with no information.
-          if (queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
-            try {
-              globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
-                success: false,
-                error: err.message
-              });
-            } catch (e) { /* ignore */ }
-          }
-        } else {
-          logToExtension('warn', 'Flow', `Prompt ${i + 1} failed (${err.message}); auto-retrying (attempt ${attempt}/${MAX_RETRIES})...`);
-          // Keep the slot marked as processing while we retry it in place.
-          queue[i].status = 'processing';
-          await ext.storage.local.set({ queue });
-          notifyPopup('updateQueue', { queue });
-          await sleep(RETRY_BACKOFF_MS);
-        }
+        } catch (e) { /* ignore */ }
+      }
+    } else {
+      queue[i].status = 'error';
+      const breaker = await J.recordOutcome(false);
+      logToExtension('warn', 'Flow', `Prompt ${i + 1} stopped: ${out.error}`);
+      notifyPopup('generationError', { message: `Flow prompt ${i + 1}: ${out.error}` });
+      if (queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
+        try {
+          globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
+            success: false,
+            error: out.error,
+            // The ledger already spent (or refused) its budget. Retrying the
+            // whole record would only repeat the same refusal.
+            noRetry: !!out.needsAttention
+          });
+        } catch (e) { /* ignore */ }
+      }
+      if (out.fatalDisconnect) {
+        notifyPopup('generationError', { message: 'Content script not loaded. Please refresh the Flow project page and try again.' });
+        isRunning = false;
+        break;
+      }
+      if (breaker.tripped) {
+        const msg = `Run halted: ${breaker.consecutive} jobs in a row failed (limit ${breaker.limit}). Fix the cause (Flow tab, quota, selectors), then press Start - nothing further was submitted.`;
+        logToExtension('error', 'Flow', msg);
+        notifyPopup('generationError', { message: msg });
+        isRunning = false;
+        break;
       }
     }
 
     await ext.storage.local.set({ queue });
     notifyPopup('updateQueue', { queue });
-
-    if (fatalDisconnect) {
-      notifyPopup('generationError', {
-        message: 'Content script not loaded. Please refresh the Flow project page and try again.'
-      });
-      // Deliver failure to any pipeline waiter for the current item so it retries
-      // immediately instead of hanging for the full 300-second timeout.
-      if (queue[i] && queue[i]._pipelineRecordId && globalThis.bulkygenPipeline) {
-        try {
-          globalThis.bulkygenPipeline.deliverGenerationResult(queue[i].id, {
-            success: false,
-            error: 'Content script fatal disconnect — page needs refresh'
-          });
-        } catch (e) { /* ignore */ }
-      }
-      isRunning = false;
-      break;
-    }
-
-    // Move to the next prompt the instant this one's image is captured.
-    const hasMorePending = queue.slice(i + 1).some(item => item.status !== 'completed');
-    if (hasMorePending && stillMine() && FLOW_GAP_MS > 0) {
-      await sleep(FLOW_GAP_MS);
-    }
   }
+  await ext.storage.local.set({ queue });
 }
 async function regenerateSingleItem(itemId) {
   if (!itemId) return;
@@ -673,12 +730,18 @@ async function regenerateSingleItem(itemId) {
   await ext.storage.local.set({ queue, currentIndex: idx });
   notifyPopup('updateQueue', { queue });
 
+  // The user explicitly asked to pay for this prompt again: release its guard
+  // (a fresh, visible submit budget) instead of letting the ledger refuse it.
+  const regenKey = flowJobKeyFor(queue[idx]);
+  try { await globalThis.bulkygenJobs?.release(regenKey); } catch (e) { /* ignore */ }
+
   try {
     await ensureTabContentScript(currentTabId);
     const response = await ext.tabs.sendMessage(currentTabId, {
       action: currentProvider === 'flow' ? 'flowSubmitPrompt' : 'generateImage',
       prompt: queue[idx].prompt,
       itemId: queue[idx].id,
+      jobKey: regenKey,
       aspectRatio: queue[idx].aspectRatio || null
     });
 

@@ -86,6 +86,9 @@ const GROK_URL = 'https://grok.com/imagine';
 const DIGEN_IMAGE_URL = 'https://digen.ai/image';
 const GENTUBE_CREATE_URL = 'https://www.gentube.app/create';
 const FIREFLY_CREATE_URL = 'https://firefly.adobe.com/generate/image';
+// Gemini Canvas share link: the user's own link is remembered (see
+// syncGeminiShareUrlFromActiveTab) so no personal link is baked into the code.
+const GEMINI_SHARE_URL_PREFIX = 'https://gemini.google.com/share/';
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -98,8 +101,24 @@ function isGrokUrl(url) { return !!url && url.includes('grok.com') && url.includ
 function isDigenUrl(url) { return !!url && url.includes('digen.ai'); }
 function isGentubeUrl(url) { return !!url && url.includes('gentube.app') && url.includes('/create'); }
 function isFireflyUrl(url) { return !!url && url.includes('firefly.adobe.com') && url.includes('/generate'); }
+function isGeminiShareUrl(url) {
+  return !!url && (/^https:\/\/gemini\.google\.com\/share\//i.test(url) || /^https:\/\/[^/]*\.?scf\.usercontent\.goog\//i.test(url));
+}
 function isSupportedUrl(url) {
-  return isFlowUrl(url) || isMetaAIUrl(url) || isGrokUrl(url) || isDigenUrl(url) || isGentubeUrl(url) || isFireflyUrl(url);
+  return isFlowUrl(url) || isMetaAIUrl(url) || isGrokUrl(url) || isDigenUrl(url) || isGentubeUrl(url) || isFireflyUrl(url) || isGeminiShareUrl(url);
+}
+
+// Remember the Gemini share link the user has open, so the "Go" button can
+// come back to it later (same idea as the Flow project id).
+async function syncGeminiShareUrlFromActiveTab() {
+  const [tab] = await ext.tabs.query({ active: true, currentWindow: true });
+  const url = tab?.url || '';
+  if (url.startsWith(GEMINI_SHARE_URL_PREFIX)) {
+    await ext.storage.local.set({ geminiShareUrl: url.split('#')[0] });
+    return url;
+  }
+  const data = await ext.storage.local.get(['geminiShareUrl']);
+  return data.geminiShareUrl || null;
 }
 
 function extractFlowProjectId(url) {
@@ -130,23 +149,30 @@ async function ensureContentScript(tabId) {
   const scripting = (globalThis.chrome && globalThis.chrome.scripting) ||
     (globalThis.browser && globalThis.browser.scripting);
   if (!scripting || tabId == null) return false;
+  let isGemini = false;
   try {
     const tab = ext.tabs.get ? await ext.tabs.get(tabId) : null;
     if (tab && !isSupportedUrl(tab.url || '')) return false;
+    // Gemini share pages: the tool is inside an iframe, so look at / inject
+    // into every frame and require the frame that has the tool's own button.
+    isGemini = !!(tab && isGeminiShareUrl(tab.url || ''));
   } catch (_) { }
+  const target = isGemini ? { tabId, allFrames: true } : { tabId };
   try {
     try {
       const probe = await scripting.executeScript({
-        target: { tabId },
-        func: () => !!window.__BULKYGEN_CS_LOADED__
+        target,
+        func: isGemini
+          ? () => !!window.__BULKYGEN_CS_LOADED__ && !!document.getElementById('generate-btn')
+          : () => !!window.__BULKYGEN_CS_LOADED__
       });
-      if (probe && probe[0] && probe[0].result) return true;
+      if (Array.isArray(probe) && probe.some((r) => r && r.result)) return true;
     } catch (_) { }
     // Keep this file list in sync with manifest.json's content_scripts entry
     // and background/tab-lifecycle.js's ensureTabContentScript -- all three
     // must inject the exact same files, in the exact same order.
     await scripting.executeScript({
-      target: { tabId },
+      target,
       files: [
         'ext.js',
         'content.js',
@@ -157,6 +183,7 @@ async function ensureContentScript(tabId) {
         'content/flow-dom.js',
         'content/flow-capture.js',
         'content/providers-generate.js',
+        'content/gemini-canvas.js',
         'content/media-capture.js',
         'content/unload-guard.js',
       ],
@@ -501,7 +528,7 @@ if (startBtn) {
     try {
       await assertSupportedPageOrThrow();
     } catch {
-      alert('Please navigate to a supported generator page first (Flow, Meta AI, Grok, DIGEN, Gentube, or Firefly).');
+      alert('Please navigate to a supported generator page first (Flow, Meta AI, Grok, DIGEN, Gentube, Firefly, or your Gemini share link).');
       return;
     }
 
@@ -610,10 +637,24 @@ if (settingsBtn) {
   });
 }
 
+// Remember which generator the user picked, so the background can reopen the
+// right page by itself when no generator tab is open (used for Gemini Canvas).
+if (generatorSelect) {
+  ext.storage.local.get(['generatorChoice']).then((d) => {
+    if (d && d.generatorChoice && Array.from(generatorSelect.options).some((o) => o.value === d.generatorChoice)) {
+      generatorSelect.value = d.generatorChoice;
+    }
+  }).catch(() => { });
+  generatorSelect.addEventListener('change', () => {
+    ext.storage.local.set({ generatorChoice: generatorSelect.value }).catch(() => { });
+  });
+}
+
 // Generator navigation
 if (goToGeneratorBtn && generatorSelect) {
   goToGeneratorBtn.addEventListener('click', async () => {
     const selected = generatorSelect.value;
+    ext.storage.local.set({ generatorChoice: selected }).catch(() => { });
     let url;
     switch (selected) {
       case 'flow':
@@ -625,6 +666,13 @@ if (goToGeneratorBtn && generatorSelect) {
       case 'digen': url = DIGEN_IMAGE_URL; break;
       case 'gentube': url = GENTUBE_CREATE_URL; break;
       case 'firefly': url = FIREFLY_CREATE_URL; break;
+      case 'geminicanvas':
+        url = await syncGeminiShareUrlFromActiveTab();
+        if (!url) {
+          alert('Open your Gemini share link in this tab once (https://gemini.google.com/share/...), then click Go again. After that, the extension remembers it.');
+          return;
+        }
+        break;
       default:
         await syncFlowProjectIdFromActiveTab();
         url = await getMappedFlowProjectUrl();
