@@ -5,7 +5,7 @@
 // (background/tool-link.js) and pushes extension events back into the page.
 //
 //   page -> bridge   { source:'bulkgen-tool', reqId, type, payload }
-//        types: hello | enqueue | control | snapshot
+//        types: hello | enqueue | control | snapshot | apiResult
 //   bridge -> page   { source:'bulkgen-ext', type:'ready' | 'ack' | 'event', ... }
 //
 // Match patterns in manifest.json decide where this may run (file://, localhost).
@@ -20,7 +20,7 @@
   const origin = location.origin === 'null' ? '*' : location.origin;
   const toPage = (msg) => window.postMessage(Object.assign({ source: 'bulkgen-ext' }, msg), origin);
 
-  const ACTIONS = { hello: 'toolHello', enqueue: 'toolEnqueue', control: 'toolControl', snapshot: 'jobSnapshot' };
+  const ACTIONS = { hello: 'toolHello', enqueue: 'toolEnqueue', control: 'toolControl', snapshot: 'jobSnapshot', apiResult: 'toolApiResult' };
 
   window.addEventListener('message', async (e) => {
     if (e.source !== window) return;

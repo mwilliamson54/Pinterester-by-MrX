@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="bulkgen-tool" content="1">
+<title>Bulk Generator (automation console)</title>
+<!--
+  AUTOMATION CONTRACT (stable on purpose - the extension and any script can rely on it)
+
+  DOM ids:    prompt-input engine aspect-ratio btn-load btn-start btn-pause btn-resume btn-stop
+              btn-zip btn-export jobs-body event-log bridge-status run-state signal-age
+              cnt-total cnt-queued cnt-active cnt-captured cnt-failed cnt-attention
+  Rows:       <tr data-job-id data-state data-submits data-phase>  (one per job)
+  State:      <script type="application/json" id="bg-state"> mirrors getState() on every change
+  JS API:     window.BulkGenTool.{getState,setPrompts,start,pause,resume,stop,release,downloadZip,on}
+  Events:     window 'bulkgen:state' (detail = state), 'bulkgen:job' (detail = job), 'bulkgen:log'
+  URL params: ?engine=flow|api  ?aspect=16:9  ?prompts=<line1>%0A<line2>  ?autostart=1
+  Extension:  content/tool-bridge.js relays postMessage {source:'bulkgen-tool'|'bulkgen-ext'}.
+  Job states (same vocabulary as the extension's job ledger):
+              queued sending submitting submitted generating captured processing done
+              failed needs_attention cancelled
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  body{font:13px/1.4 system-ui,Segoe UI,Arial,sans-serif;margin:0;padding:10px;color:#111;background:#fff}
+  h1{font-size:15px;margin:0 0 8px}
+  fieldset{border:1px solid #999;margin:0 0 8px;padding:6px 8px}
+  legend{font-weight:600}
+  label{margin-right:10px;white-space:nowrap}
+  textarea{width:100%;box-sizing:border-box;font:12px monospace}
+  input[type=text],input[type=password],input[type=number],select{font:inherit}
+  button{font:inherit;padding:3px 10px;cursor:pointer}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  table{border-collapse:collapse;width:100%}
+  th,td{border:1px solid #bbb;padding:3px 5px;text-align:left;vertical-align:top}
+  th{background:#eee}
+  td.prompt{max-width:360px;word-break:break-word}
+  img.thumb{width:56px;height:56px;object-fit:cover;display:block;margin-bottom:2px}
+  #event-log{height:150px;overflow:auto;border:1px solid #999;background:#fafafa;margin:0;padding:4px;font:11px monospace;white-space:pre-wrap}
+  .bar span{margin-right:14px}
+  .st-needs_attention,.st-failed{color:#b00020;font-weight:700}
+  .st-captured,.st-done{color:#176b30;font-weight:700}
+  .st-generating,.st-submitted,.st-submitting,.st-sending{color:#9a6200;font-weight:700}
+  .warn{color:#b00020;font-weight:700}
+  .muted{color:#666}
+</style>
+</head>
+<body>
+<h1>Bulk Generator &mdash; automation console</h1>
+
+<div class="bar" id="status-bar">
+  <span>Bridge: <b id="bridge-status">not linked</b></span>
+  <span>Run: <b id="run-state">idle</b></span>
+  <span>Last signal: <b id="signal-age">-</b></span>
+  <span>Total <b id="cnt-total">0</b></span>
+  <span>Queued <b id="cnt-queued">0</b></span>
+  <span>Active <b id="cnt-active">0</b></span>
+  <span>Captured <b id="cnt-captured">0</b></span>
+  <span>Failed <b id="cnt-failed">0</b></span>
+  <span>Needs attention <b id="cnt-attention">0</b></span>
+</div>
+
+<fieldset>
+  <legend>Setup</legend>
+  <label>Engine
+    <select id="engine">
+      <option value="flow">flow (browser extension drives Google Flow)</option>
+      <option value="api">api (Gemini image API, direct)</option>
+    </select>
+  </label>
+  <label>Aspect
+    <select id="aspect-ratio">
+      <option value="1:1">1:1</option><option value="16:9">16:9</option><option value="9:16">9:16</option>
+      <option value="4:3">4:3</option><option value="3:4">3:4</option>
+    </select>
+  </label>
+  <span id="api-options">
+    <label>API key <input type="password" id="api-key" size="22" autocomplete="off" placeholder="leave empty in Gemini Canvas"></label>
+    <label>Concurrency <input type="number" id="api-concurrency" value="3" min="1" max="10" style="width:50px"></label>
+    <label>Retries (429/5xx only) <input type="number" id="api-retries" value="1" min="0" max="3" style="width:45px"></label>
+    <label><input type="checkbox" id="api-auto-refine"> rewrite prompt once after a SAFETY block</label>
+  </span>
+  <div id="api-consistency" style="margin-top:4px">
+    <label><input type="checkbox" id="char-enabled"> character notes</label>
+    <input type="text" id="char-desc" size="38" placeholder="appended to every prompt (api engine)">
+    <input type="file" id="char-file" accept="image/*">
+    <label><input type="checkbox" id="style-enabled"> style notes</label>
+    <input type="text" id="style-desc" size="38" placeholder="appended to every prompt (api engine)">
+    <input type="file" id="style-file" accept="image/*">
+  </div>
+  <div class="muted" id="flow-note" style="margin-top:4px">
+    flow engine: the extension owns the credit guard. Each prompt is submitted at most
+    <b id="max-submits">2</b> time(s), and only a PROVEN failed generation is ever resubmitted automatically.
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Prompts (one per line)</legend>
+  <textarea id="prompt-input" rows="6" placeholder="one prompt per line"></textarea>
+  <div style="margin-top:4px">
+    <button id="btn-load">Load prompts into queue</button>
+    <button id="btn-start" disabled>Start</button>
+    <button id="btn-pause" disabled>Pause</button>
+    <button id="btn-resume" disabled>Resume</button>
+    <button id="btn-stop" disabled>Stop</button>
+    <button id="btn-zip" disabled>Download ZIP</button>
+    <button id="btn-export">Export state (JSON)</button>
+    <span id="msg" class="warn"></span>
+  </div>
+</fieldset>
+
+<table id="jobs">
+  <thead><tr><th>#</th><th>Job id</th><th>State</th><th>Subs</th><th>Phase / detail</th><th>Age</th><th>Prompt</th><th>Result</th><th>Actions</th></tr></thead>
+  <tbody id="jobs-body"></tbody>
+</table>
+
+<h3 style="margin:10px 0 4px;font-size:13px">Event log</h3>
+<pre id="event-log"></pre>
+<script type="application/json" id="bg-state">{}</script>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var TERMINAL_OK = { captured: 1, done: 1 };
+  var ACTIVE = { sending: 1, submitting: 1, submitted: 1, generating: 1, processing: 1 };
+
+  var S = {
+    engine: 'flow',
+    runId: null,
+    run: 'idle',               // idle | running | paused
+    jobs: [],                  // {id, extId, index, prompt, aspectRatio, state, submitCount, phase, detail, error, counts, images:[{dataUrl,mime}], updatedAt}
+    lastSignalAt: 0,
+    bridge: { linked: false, maxSubmits: 2, breaker: null },
+    stopRequested: false
+  };
+  var listeners = {};
+
+  // ── tiny helpers ────────────────────────────────────────────────────────
+  function now() { return Date.now(); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function age(t) { if (!t) return ''; var s = Math.max(0, Math.round((now() - t) / 1000)); return s < 90 ? s + 's' : Math.round(s / 60) + 'm'; }
+  function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'image'; }
+  function emit(name, detail) {
+    (listeners[name] || []).forEach(function (fn) { try { fn(detail); } catch (e) { } });
+    try { window.dispatchEvent(new CustomEvent('bulkgen:' + name, { detail: detail })); } catch (e) { }
+  }
+  function log(text) {
+    var el = $('event-log');
+    var line = new Date().toISOString().slice(11, 19) + '  ' + text;
+    el.textContent += line + '\n';
+    if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
+    el.scrollTop = el.scrollHeight;
+    emit('log', line);
+  }
+  function setMsg(t) { $('msg').textContent = t || ''; }
+
+  // ── state mirror ────────────────────────────────────────────────────────
+  function publicState() {
+    return {
+      engine: S.engine, runId: S.runId, run: S.run, lastSignalAt: S.lastSignalAt, bridge: S.bridge,
+      counts: counts(),
+      jobs: S.jobs.map(function (j) {
+        return {
+          id: j.id, extId: j.extId, index: j.index, prompt: j.prompt, aspectRatio: j.aspectRatio, state: j.state,
+          submitCount: j.submitCount, phase: j.phase, detail: j.detail, error: j.error,
+          images: (j.images || []).length, updatedAt: j.updatedAt
+        };
+      })
+    };
+  }
+  function counts() {
+    var c = { total: S.jobs.length, queued: 0, active: 0, captured: 0, failed: 0, attention: 0 };
+    S.jobs.forEach(function (j) {
+      if (j.state === 'queued' || j.state === 'cancelled') c.queued++;
+      else if (ACTIVE[j.state]) c.active++;
+      else if (TERMINAL_OK[j.state]) c.captured++;
+      else if (j.state === 'failed') c.failed++;
+      else if (j.state === 'needs_attention') c.attention++;
+    });
+    return c;
+  }
+
+  // ── rendering (cheap and deterministic: no animation, no framework) ─────
+  function render() {
+    var body = $('jobs-body');
+    body.innerHTML = S.jobs.map(function (j) {
+      var thumbs = (j.images || []).map(function (im, k) {
+        return '<img class="thumb" src="' + im.dataUrl + '" alt="">' +
+          '<a href="' + im.dataUrl + '" download="' + esc(fileName(j, k)) + '">save</a> ';
+      }).join('');
+      var canResubmit = S.engine === 'flow' && (j.state === 'needs_attention' || j.state === 'failed');
+      var canRetryApi = S.engine === 'api' && j.state === 'failed';
+      return '<tr data-job-id="' + esc(j.id) + '" data-state="' + esc(j.state) + '" data-submits="' + j.submitCount +
+        '" data-phase="' + esc(j.phase) + '">' +
+        '<td>' + (j.index + 1) + '</td>' +
+        '<td>' + esc(j.extId || j.id) + '</td>' +
+        '<td class="st-' + esc(j.state) + '">' + esc(j.state) + '</td>' +
+        '<td>' + j.submitCount + '/' + S.bridge.maxSubmits + '</td>' +
+        '<td>' + esc(j.phase) + (j.counts ? ' <span class="muted">(tiles ' + j.counts.tiles + ', imgs ' + j.counts.imgs + ', err ' + j.counts.errors + (j.counts.generating ? ', generating' : '') + ')</span>' : '') +
+        (j.error ? '<br><span class="warn">' + esc(j.error) + '</span>' : (j.detail ? '<br><span class="muted">' + esc(j.detail) + '</span>' : '')) + '</td>' +
+        '<td>' + age(j.updatedAt) + '</td>' +
+        '<td class="prompt">' + esc(j.prompt) + '</td>' +
+        '<td>' + thumbs + '</td>' +
+        '<td>' + (canResubmit ? '<button data-act="resubmit" data-id="' + esc(j.id) + '" title="Spends credits again">Resubmit (costs credits)</button>' : '') +
+        (canRetryApi ? '<button data-act="retry-api" data-id="' + esc(j.id) + '">Retry</button>' : '') + '</td></tr>';
+    }).join('');
+
+    var c = counts();
+    $('cnt-total').textContent = c.total; $('cnt-queued').textContent = c.queued; $('cnt-active').textContent = c.active;
+    $('cnt-captured').textContent = c.captured; $('cnt-failed').textContent = c.failed; $('cnt-attention').textContent = c.attention;
+    $('run-state').textContent = S.run;
+    $('bridge-status').textContent = S.bridge.linked ? 'linked to extension' : 'not linked';
+    $('max-submits').textContent = S.bridge.maxSubmits;
+
+    var hasQueued = S.jobs.some(function (j) { return j.state === 'queued'; });
+    var running = S.run !== 'idle';
+    $('btn-start').disabled = running || !hasQueued || (S.engine === 'flow' && !S.bridge.linked);
+    $('btn-pause').disabled = !(S.run === 'running') || S.engine !== 'flow';
+    $('btn-resume').disabled = !(S.run === 'paused') || S.engine !== 'flow';
+    $('btn-stop').disabled = !running;
+    $('btn-zip').disabled = !S.jobs.some(function (j) { return j.images && j.images.length; });
+    $('api-options').style.display = S.engine === 'api' ? '' : 'none';
+    $('api-consistency').style.display = S.engine === 'api' ? '' : 'none';
+    $('flow-note').style.display = S.engine === 'flow' ? '' : 'none';
+
+    $('bg-state').textContent = JSON.stringify(publicState());
+    emit('state', publicState());
+  }
+
+  function fileName(j, k) {
+    var im = (j.images || [])[k]; var mime = (im && im.mime) || ((im && im.dataUrl || '').match(/^data:([^;]+);/) || [])[1] || 'image/png';
+    var ext = mime.indexOf('jpeg') >= 0 ? 'jpg' : mime.indexOf('webp') >= 0 ? 'webp' : 'png';
+    return String(j.index + 1).padStart(3, '0') + (j.images.length > 1 ? '_' + (k + 1) : '') + '_' + slug(j.prompt) + '.' + ext;
+  }
+
+  function patchJob(job, patch) {
+    Object.keys(patch).forEach(function (k) { job[k] = patch[k]; });
+    job.updatedAt = now();
+    S.lastSignalAt = job.updatedAt;
+    emit('job', job);
+  }
+
+  // ── prompts ─────────────────────────────────────────────────────────────
+  function setPrompts(list) {
+    var seen = {};
+    var cleaned = [];
+    (list || []).forEach(function (p) {
+      p = String(p).replace(/\s+/g, ' ').trim();
+      if (!p || seen[p]) return;     // empty lines and exact duplicates never cost credits
+      seen[p] = 1; cleaned.push(p);
+    });
+    var aspect = $('aspect-ratio').value;
+    var dropped = (list || []).length - cleaned.length;
+    S.jobs = cleaned.map(function (p, i) {
+      return { id: 'j' + (i + 1), extId: null, index: i, prompt: p, aspectRatio: aspect, state: 'queued', submitCount: 0, phase: 'queued', detail: '', error: null, counts: null, images: [], updatedAt: now() };
+    });
+    S.runId = null;
+    log('loaded ' + cleaned.length + ' prompt(s)' + (dropped ? ', skipped ' + dropped + ' empty/duplicate line(s)' : ''));
+    render();
+    return cleaned.length;
+  }
+
+  // ── extension bridge ────────────────────────────────────────────────────
+  var bridge = {
+    pending: {}, n: 0,
+    send: function (type, payload, timeoutMs) {
+      return new Promise(function (resolve) {
+        var reqId = 'r' + (++bridge.n);
+        var t = setTimeout(function () { delete bridge.pending[reqId]; resolve({ ok: false, reason: 'no answer from extension bridge (is the extension installed and file access enabled?)' }); }, timeoutMs || 8000);
+        bridge.pending[reqId] = function (r) { clearTimeout(t); resolve(r); };
+        window.postMessage({ source: 'bulkgen-tool', reqId: reqId, type: type, payload: payload || {} }, '*');
+      });
+    }
+  };
+
+  function applyRunInfo(r) {
+    if (!r) return;
+    if (r.config && r.config.maxSubmitsPerJob) S.bridge.maxSubmits = r.config.maxSubmitsPerJob;
+    if (r.breaker) S.bridge.breaker = r.breaker;
+    if (S.engine === 'flow' && typeof r.isRunning === 'boolean') {
+      var next = r.isRunning ? (r.isPaused ? 'paused' : 'running') : 'idle';
+      if (next !== S.run) { S.run = next; log('extension run state: ' + next); }
+    }
+  }
+
+  function findByExtId(id) { return S.jobs.filter(function (j) { return j.extId === id; })[0]; }
+
+  function onExtEvent(ev) {
+    if (!ev) return;
+    if (ev.type === 'ping') { hello(); return; }   // extension asks us to (re)announce
+    S.lastSignalAt = now();
+    if (ev.type === 'job' && ev.job) {
+      var j = findByExtId(ev.job.key);
+      if (!j) return;
+      patchJob(j, {
+        state: ev.job.state, submitCount: ev.job.submitCount, phase: ev.job.phase, detail: ev.job.detail || '',
+        error: ev.job.error || null, counts: ev.job.counts || j.counts
+      });
+      if (ev.note && ['created', 'progress'].indexOf(ev.note) < 0) log(j.id + ' ' + ev.job.state + ' / ' + ev.job.phase + (ev.job.detail ? ' - ' + ev.job.detail : ''));
+    } else if (ev.type === 'result') {
+      var jr = findByExtId(ev.jobId);
+      if (!jr) return;
+      patchJob(jr, { images: (ev.images || []).map(function (im) { return { dataUrl: im.dataUrl, mime: (im.dataUrl.match(/^data:([^;]+);/) || [])[1] }; }), state: 'captured', error: null });
+      log(jr.id + ' received ' + jr.images.length + ' image(s)');
+    } else if (ev.type === 'run') {
+      applyRunInfo(ev);
+      if (ev.info && ev.info.error) { setMsg(ev.info.error); log('extension: ' + ev.info.error); }
+      if (ev.state === 'idle') {
+        S.run = 'idle';
+        S.jobs.forEach(function (j) { if (j.state === 'sending') patchJob(j, { state: 'queued', phase: 'queued' }); });
+        log('run finished' + (ev.breaker && ev.breaker.tripped ? ' (circuit breaker halted it)' : ''));
+      }
+    } else if (ev.type === 'command' && ev.cmd === 'api_generate' && ev.job) {
+      runExtensionCommand(ev.job);
+    } else if (ev.type === 'probe') {
+      log('probe: ' + JSON.stringify(ev));
+    }
+    render();
+  }
+
+  window.addEventListener('message', function (e) {
+    if (e.source !== window) return;
+    var d = e.data;
+    if (!d || d.source !== 'bulkgen-ext') return;
+    if (d.type === 'ack') { var cb = bridge.pending[d.reqId]; if (cb) { delete bridge.pending[d.reqId]; cb(d.reply); } }
+    else if (d.type === 'event') onExtEvent(d.event);
+    else if (d.type === 'ready') { hello(); }
+  });
+
+  function hello() {
+    return bridge.send('hello', {}, 3000).then(function (r) {
+      if (r && r.ok) {
+        if (!S.bridge.linked) log('extension linked');
+        S.bridge.linked = true;
+        applyRunInfo(r);
+        (r.jobs || []).forEach(function (ej) { var j = findByExtId(ej.key); if (j) patchJob(j, { state: ej.state, submitCount: ej.submitCount, phase: ej.phase, detail: ej.detail || '', error: ej.error || null }); });
+      } else {
+        S.bridge.linked = false;
+      }
+      render();
+    });
+  }
+
+  // ── flow engine (extension) ─────────────────────────────────────────────
+  function startFlow(onlyJobs) {
+    var jobs = onlyJobs || S.jobs.filter(function (j) { return j.state === 'queued'; });
+    if (!jobs.length) return Promise.resolve();
+    S.runId = Date.now().toString(36);
+    var aspect = $('aspect-ratio').value;
+    jobs.forEach(function (j, n) { j.extId = S.runId + '-' + (j.index + 1); j.aspectRatio = aspect; patchJob(j, { state: 'sending', phase: 'sending to extension', error: null }); });
+    render();
+    return bridge.send('enqueue', { runId: S.runId, jobs: jobs.map(function (j) { return { id: j.extId, prompt: j.prompt, aspectRatio: j.aspectRatio }; }) }, 15000).then(function (r) {
+      if (!r || !r.ok) {
+        jobs.forEach(function (j) { patchJob(j, { state: 'queued', phase: 'queued' }); });
+        var why = (r && r.reason) || 'unknown';
+        setMsg(why === 'busy' ? 'Extension is busy with another run. Wait for it or press Stop.' : 'Extension refused: ' + why);
+        log('enqueue refused: ' + why);
+      } else {
+        setMsg(''); S.run = 'running'; S.lastSignalAt = now(); applyRunInfo(r);
+        log('enqueued ' + r.count + ' job(s), run ' + S.runId);
+      }
+      render();
+    });
+  }
+
+  // ── api engine (Gemini, direct) ─────────────────────────────────────────
+  var refs = { char: null, style: null };
+  function readRef(inputId, key) {
+    var f = $(inputId).files[0]; if (!f) { refs[key] = null; return; }
+    var fr = new FileReader();
+    fr.onload = function () { refs[key] = { mime: f.type, data: String(fr.result).split(',')[1] }; };
+    fr.readAsDataURL(f);
+  }
+  $('char-file').addEventListener('change', function () { readRef('char-file', 'char'); });
+  $('style-file').addEventListener('change', function () { readRef('style-file', 'style'); });
+
+  function apiCall(prompt, aspect) {
+    var final = prompt;
+    var parts = [];
+    if ($('char-enabled').checked && $('char-desc').value.trim()) final += '. Character notes: ' + $('char-desc').value.trim();
+    if ($('style-enabled').checked && $('style-desc').value.trim()) final += '. Style notes: ' + $('style-desc').value.trim();
+    parts.push({ text: final });
+    if ($('char-enabled').checked && refs.char) parts.push({ inlineData: { mimeType: refs.char.mime, data: refs.char.data } });
+    if ($('style-enabled').checked && refs.style) parts.push({ inlineData: { mimeType: refs.style.mime, data: refs.style.data } });
+    var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key=' + encodeURIComponent($('api-key').value.trim());
+    return fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: parts }], generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: aspect } } })
+    }).then(function (res) {
+      if (!res.ok) { var e = new Error('HTTP ' + res.status + (res.status === 400 || res.status === 403 ? ' (no API key: paste one above if this page is not hosted in Gemini Canvas)' : '')); e.status = res.status; throw e; }
+      return res.json();
+    }).then(function (data) {
+      var cand = data.candidates && data.candidates[0];
+      if (cand && cand.finishReason === 'SAFETY') { var e = new Error('SAFETY'); e.safety = true; throw e; }
+      var part = cand && cand.content && cand.content.parts && cand.content.parts.filter(function (p) { return p.inlineData; })[0];
+      if (!part) throw new Error('response contained no image');
+      return 'data:' + part.inlineData.mimeType + ';base64,' + part.inlineData.data;
+    });
+  }
+
+  function runApiJob(j) {
+    var maxRetries = parseInt($('api-retries').value, 10) || 0;
+    var refined = false;
+    function attempt(n, prompt) {
+      if (S.stopRequested) { patchJob(j, { state: 'cancelled', phase: 'cancelled' }); return Promise.resolve(); }
+      patchJob(j, { state: 'generating', phase: 'request ' + (n + 1), submitCount: j.submitCount + 1 });
+      render();
+      return apiCall(prompt, j.aspectRatio).then(function (dataUrl) {
+        patchJob(j, { state: 'captured', phase: 'captured', images: [{ dataUrl: dataUrl, mime: (dataUrl.match(/^data:([^;]+);/) || [])[1] }], error: null });
+      }, function (err) {
+        // Only transient transport errors are retried. Content/safety/auth errors are not.
+        if (err.safety && $('api-auto-refine').checked && !refined) {
+          refined = true;
+          log(j.id + ' SAFETY block - one prompt rewrite (opt-in)');
+          return attempt(n, prompt + '. Keep it family friendly, non-graphic and suitable for all audiences');
+        }
+        if ((err.status === 429 || err.status >= 500) && n < maxRetries) {
+          log(j.id + ' ' + err.message + ' - retry ' + (n + 1) + '/' + maxRetries);
+          return new Promise(function (r) { setTimeout(r, 2000 * (n + 1)); }).then(function () { return attempt(n + 1, prompt); });
+        }
+        patchJob(j, { state: 'failed', phase: 'failed', error: err.message });
+      });
+    }
+    return attempt(0, j.prompt);
+  }
+
+  function startApi(onlyJobs) {
+    // Hosted in Gemini Canvas / a gemini.google.com share link, the key is injected
+    // by the host, so an empty key is correct there. Only warn when a call fails.
+    setMsg('');
+    var queue = (onlyJobs || S.jobs.filter(function (j) { return j.state === 'queued'; })).slice();
+    var concurrency = Math.max(1, Math.min(10, parseInt($('api-concurrency').value, 10) || 3));
+    S.run = 'running'; S.stopRequested = false; render();
+    return new Promise(function (resolve) {
+      var active = 0;
+      (function pump() {
+        if (!queue.length && active === 0) { S.run = 'idle'; log('api run finished'); render(); return resolve(); }
+        while (active < concurrency && queue.length && !S.stopRequested) {
+          var j = queue.shift(); active++;
+          runApiJob(j).then(function () { active--; render(); pump(); });
+        }
+        if (S.stopRequested && active === 0) { S.run = 'idle'; render(); resolve(); }
+      })();
+    });
+  }
+
+  // The extension asked this page to run ONE api request (extension popup Start
+  // on a gemini.google.com page). The extension owns the queue and credit guard;
+  // we only perform the call and report the outcome.
+  function runExtensionCommand(cmdJob) {
+    var j = findByExtId(cmdJob.id);
+    if (!j) {
+      j = { id: 'e' + (S.jobs.length + 1), extId: cmdJob.id, index: S.jobs.length, prompt: cmdJob.prompt, aspectRatio: cmdJob.aspectRatio || $('aspect-ratio').value, state: 'generating', submitCount: 0, phase: 'request from extension', detail: '', error: null, counts: null, images: [], updatedAt: now() };
+      S.jobs.push(j);
+    }
+    S.run = 'running'; patchJob(j, { state: 'generating', phase: 'api request (extension)' }); render();
+    apiCall(cmdJob.prompt, cmdJob.aspectRatio || j.aspectRatio || $('aspect-ratio').value).then(function (dataUrl) {
+      patchJob(j, { state: 'captured', phase: 'captured', images: [{ dataUrl: dataUrl, mime: (dataUrl.match(/^data:([^;]+);/) || [])[1] }], error: null });
+      render();
+      return bridge.send('apiResult', { jobId: cmdJob.id, ok: true, dataUrl: dataUrl }, 20000);
+    }, function (err) {
+      patchJob(j, { state: 'failed', phase: 'failed', error: err.message }); render();
+      return bridge.send('apiResult', { jobId: cmdJob.id, ok: false, error: err.message, status: err.status || null }, 20000);
+    });
+  }
+
+  // ── controls ────────────────────────────────────────────────────────────
+  function start() { return S.engine === 'flow' ? startFlow() : startApi(); }
+  function pause() { return bridge.send('control', { cmd: 'pause' }).then(function (r) { applyRunInfo(r); render(); }); }
+  function resume() { return bridge.send('control', { cmd: 'resume' }).then(function (r) { applyRunInfo(r); render(); }); }
+  function stop() {
+    S.stopRequested = true;
+    if (S.engine === 'flow') return bridge.send('control', { cmd: 'stop' }).then(function (r) { applyRunInfo(r); S.run = 'idle'; render(); });
+    S.run = S.jobs.some(function (j) { return j.state === 'generating'; }) ? S.run : 'idle'; render();
+    return Promise.resolve();
+  }
+  function release(jobId) {
+    var j = S.jobs.filter(function (x) { return x.id === jobId; })[0];
+    if (!j || !j.extId) return Promise.resolve(false);
+    return bridge.send('control', { cmd: 'release', jobId: j.extId }).then(function (r) { return !!(r && r.ok); });
+  }
+
+  function downloadZip() {
+    var withImages = S.jobs.filter(function (j) { return j.images && j.images.length; });
+    if (!withImages.length) return Promise.resolve();
+    if (typeof JSZip === 'undefined') { setMsg('JSZip failed to load; use the per-image save links.'); return Promise.resolve(); }
+    var zip = new JSZip();
+    withImages.forEach(function (j) {
+      j.images.forEach(function (im, k) { zip.file(fileName(j, k), im.dataUrl.split(',')[1], { base64: true }); });
+    });
+    return zip.generateAsync({ type: 'blob' }).then(function (blob) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = 'bulk-images-' + (S.runId || Date.now()) + '.zip';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+  }
+
+  // ── wiring ──────────────────────────────────────────────────────────────
+  $('btn-load').addEventListener('click', function () { setPrompts($('prompt-input').value.split(/\r?\n/)); });
+  $('btn-start').addEventListener('click', start);
+  $('btn-pause').addEventListener('click', pause);
+  $('btn-resume').addEventListener('click', resume);
+  $('btn-stop').addEventListener('click', stop);
+  $('btn-zip').addEventListener('click', downloadZip);
+  $('btn-export').addEventListener('click', function () {
+    var blob = new Blob([JSON.stringify(publicState(), null, 2)], { type: 'application/json' });
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk-state.json';
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  $('engine').addEventListener('change', function () { S.engine = $('engine').value; render(); });
+
+  $('jobs-body').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    var j = S.jobs.filter(function (x) { return x.id === b.getAttribute('data-id'); })[0]; if (!j) return;
+    if (b.getAttribute('data-act') === 'resubmit') {
+      if (!confirm('Resubmit this prompt to Flow? This spends credits again.')) return;
+      release(j.id).then(function (ok) {
+        if (!ok) { setMsg('Extension did not release the job guard.'); return; }
+        patchJob(j, { state: 'queued', phase: 'queued', error: null, submitCount: 0 });
+        startFlow([j]);
+      });
+    } else if (b.getAttribute('data-act') === 'retry-api') {
+      patchJob(j, { state: 'queued', error: null }); startApi([j]);
+    }
+  });
+
+  // Silence watchdog: the tool never assumes "still working". If the extension
+  // goes quiet it says so and asks the Flow tab directly.
+  var lastProbeAt = 0;
+  setInterval(function () {
+    $('signal-age').textContent = S.lastSignalAt ? age(S.lastSignalAt) + ' ago' : '-';
+    if (S.engine === 'flow' && S.run === 'running' && S.lastSignalAt && now() - S.lastSignalAt > 45000) {
+      $('signal-age').innerHTML = '<span class="warn">NO SIGNAL ' + age(S.lastSignalAt) + '</span>';
+      if (now() - lastProbeAt > 45000) {
+        lastProbeAt = now();
+        bridge.send('control', { cmd: 'probe' }, 6000).then(function (r) { log('silence probe: ' + JSON.stringify(r)); });
+        hello();
+      }
+    }
+    if (S.jobs.some(function (j) { return ACTIVE[j.state]; })) render();
+  }, 5000);
+  // Re-announce regularly: the extension's service worker can restart and forget this tab.
+  setInterval(function () { hello(); }, S.bridge.linked ? 15000 : 4000);
+  setInterval(function () { if (!S.bridge.linked) hello(); }, 4000);
+
+  // ── public API ──────────────────────────────────────────────────────────
+  window.BulkGenTool = {
+    version: 2,
+    getState: publicState,
+    setPrompts: setPrompts,
+    start: start, pause: pause, resume: resume, stop: stop, release: release, downloadZip: downloadZip,
+    setEngine: function (e) { $('engine').value = e; S.engine = e; render(); },
+    getImages: function (id) { var j = S.jobs.filter(function (x) { return x.id === id; })[0]; return j ? j.images : []; },
+    on: function (name, fn) { (listeners[name] = listeners[name] || []).push(fn); }
+  };
+
+  // URL params for headless / scripted use
+  var q = new URLSearchParams(location.search);
+  if (q.get('engine') === 'api' || q.get('engine') === 'flow') { $('engine').value = q.get('engine'); S.engine = q.get('engine'); }
+  if (q.get('aspect')) $('aspect-ratio').value = q.get('aspect');
+  render();
+  hello();
+  if (q.get('prompts')) {
+    $('prompt-input').value = q.get('prompts');
+    setPrompts(q.get('prompts').split(/\r?\n/));
+    if (q.get('autostart') === '1') setTimeout(start, 1200);
+  }
+})();
+</script>
+</body>
+</html>

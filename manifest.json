@@ -68,6 +68,19 @@
         "http://127.0.0.1/*"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "js": [
+        "content/tool-bridge.js"
+      ],
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://*.googleusercontent.com/*",
+        "https://*.usercontent.goog/*"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
     }
   ],
   "description": "Queue a list of prompts and generate them automatically, one line at a time, on supported AI image and video generator sites.",
@@ -105,7 +118,10 @@
     "https://*.supabase.io/*",
     "https://www.googleapis.com/*",
     "https://oauth2.googleapis.com/*",
-    "https://www.googleapis.com/upload/*"
+    "https://www.googleapis.com/upload/*",
+    "https://gemini.google.com/*",
+    "https://*.usercontent.goog/*",
+    "https://*.googleusercontent.com/*"
   ],
   "icons": {
     "128": "icons/BulkyGen.png",

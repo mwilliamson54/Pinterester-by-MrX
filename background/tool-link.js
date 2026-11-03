@@ -59,6 +59,50 @@
     });
   }
 
+  // ── extension -> tool "api engine" commands (Gemini-hosted tool) ────────────
+  const pendingApi = new Map();
+
+  function isToolTab(tabId) { return toolTabs.has(tabId); }
+
+  /**
+   * Make sure the tool page in this tab is linked. The service worker forgets its
+   * tab list whenever it restarts, and the page's bridge may never have been
+   * injected into a sandboxed Canvas iframe, so: (1) inject the bridge into every
+   * frame of the tab, (2) ask the page to announce itself, (3) wait briefly.
+   */
+  async function ensureLinked(tabId, waitMs) {
+    if (toolTabs.has(tabId)) return true;
+    try {
+      const scripting = (globalThis.chrome && globalThis.chrome.scripting) || (globalThis.browser && globalThis.browser.scripting);
+      if (scripting) await scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content/tool-bridge.js'] });
+    } catch (e) { /* frames we have no permission for are skipped; ping below tells us */ }
+    const deadline = Date.now() + (waitMs || 5000);
+    while (Date.now() < deadline) {
+      try { const p = ext.tabs.sendMessage(tabId, { action: 'toolEvent', event: { type: 'ping' } }); if (p && p.catch) p.catch(() => { }); } catch (e) { /* ignore */ }
+      await new Promise(r => setTimeout(r, 400));
+      if (toolTabs.has(tabId)) return true;
+    }
+    return false;
+  }
+  function firstToolTab() { const it = toolTabs.values().next(); return it.done ? null : it.value; }
+
+  /** Ask the tool page to run its Gemini API call for one job and wait for the answer. */
+  function runApi(tabId, job, timeoutMs) {
+    return new Promise((resolve) => {
+      const t = setTimeout(() => {
+        pendingApi.delete(job.id);
+        resolve({ ok: false, timeout: true, error: `tool page did not answer within ${Math.round(timeoutMs / 1000)}s` });
+      }, timeoutMs);
+      pendingApi.set(job.id, (r) => { clearTimeout(t); resolve(r); });
+      try {
+        const p = ext.tabs.sendMessage(tabId, { action: 'toolEvent', event: { type: 'command', cmd: 'api_generate', job } });
+        if (p && p.catch) p.catch((e) => {
+          if (pendingApi.has(job.id)) { pendingApi.delete(job.id); clearTimeout(t); resolve({ ok: false, unreachable: true, error: 'tool page unreachable: ' + (e && e.message) }); }
+        });
+      } catch (e) { pendingApi.delete(job.id); clearTimeout(t); resolve({ ok: false, unreachable: true, error: String(e && e.message || e) }); }
+    });
+  }
+
   async function toolEnqueue(message) {
     const input = Array.isArray(message.jobs) ? message.jobs : [];
     const queue = input
@@ -189,6 +233,12 @@
         if (sender && sender.tab) toolTabs.add(sender.tab.id);
         toolEnqueue(message).then(sendResponse, (e) => sendResponse({ ok: false, reason: e && e.message }));
         return true;
+      case 'toolApiResult': {
+        const cb = pendingApi.get(String(message.jobId));
+        if (cb) { pendingApi.delete(String(message.jobId)); cb(message); }
+        sendResponse({ ok: !!cb });
+        return false;
+      }
       case 'toolControl':
         toolControl(message).then(sendResponse, (e) => sendResponse({ ok: false, reason: e && e.message }));
         return true;
@@ -198,6 +248,6 @@
   });
 
 
-  globalThis.bulkygenToolLink = { publishRun, publishResult, push: pushToTools, probeFlowTab };
+  globalThis.bulkygenToolLink = { publishRun, publishResult, push: pushToTools, probeFlowTab, isToolTab, firstToolTab, ensureLinked, runApi };
   wireLedger();
 })();

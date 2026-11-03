@@ -66,13 +66,17 @@ async function startGeneration(resumeTabId) {
         // 2. Search ALL open tabs for any supported generator page
         const allTabs = await ext.tabs.query({});
         const supportedTab = allTabs.find(t => isSupportedTabUrl(t.url));
+        const linkedToolTab = globalThis.bulkygenToolLink?.firstToolTab?.();
         if (supportedTab) {
           tabId = supportedTab.id;
           console.log(`BulkyGen: Using background tab ${tabId} (${supportedTab.url.slice(0, 60)}...)`);
+        } else if (linkedToolTab != null) {
+          tabId = linkedToolTab;   // Gemini-hosted tool page that linked itself over the bridge
         } else {
           // 3. No supported page open anywhere — report error and exit
           const msg = 'No supported generator page found. Please open one of:\n- Flow: https://flow.google.com/project\n- Meta AI: https://www.meta.ai/media\n- Grok: https://grok.com/imagine\n- Digen: https://digen.ai/image\n- Gentube: https://www.gentube.app/create\n- Firefly: https://firefly.adobe.com/generate/image';
           logToExtension('warn', 'Background', 'startGeneration aborted — no supported tab found. ' + msg.split('\n')[0]);
+          try { globalThis.bulkygenToolLink?.publishRun('idle', { error: 'No Flow tab is open. Open your Flow project page (https://labs.google/fx/tools/flow or https://flow.google.com/project) in another tab, then press Start again.' }); } catch (e) { /* ignore */ }
           notifyPopup('generationError', { message: msg });
           await _reportPipelineStartFailure('No supported generator page found');
           await _failQueuedItems('No supported generator page found');
@@ -92,11 +96,28 @@ async function startGeneration(resumeTabId) {
     try { ext.tabs.sendMessage(tabId, { action: 'bgKeepAlive', on: true }).catch(() => { }); } catch (e) { }
     let currentProvider = 'unknown';
 
+    // A Gemini-hosted Bulk Generator page has no provider content script: it is
+    // driven over the tool bridge (api engine) instead of by DOM automation.
+    let geminiTab = !!globalThis.bulkygenToolLink?.isToolTab?.(currentTabId);
+    if (!geminiTab) {
+      try { const t = await ext.tabs.get(currentTabId); geminiTab = !!(t && t.url && t.url.includes('gemini.google.com/')); } catch (e) { /* ignore */ }
+    }
+    if (geminiTab && !(await globalThis.bulkygenToolLink?.ensureLinked?.(currentTabId, 6000))) {
+      const msg = 'Gemini page found, but the Bulk Generator tool did not answer over the bridge. Make sure the tool is open (not just the Gemini chat), wait for "Bridge: linked to extension" in its status bar, then press Start. If it never links, the tool runs in an iframe the extension cannot reach - see the extension service-worker log for the frame URLs.';
+      logToExtension('warn', 'Background', msg);
+      notifyPopup('generationError', { message: msg });
+      await _reportPipelineStartFailure('tool bridge not linked');
+      await _failQueuedItems('tool bridge not linked');
+      isRunning = false; loopActive = false; loopActiveSince = null;
+      await ext.storage.local.set({ isRunning: false });
+      return;
+    }
+
     // Make sure the content script is loaded (no manual page reload needed).
     // Bounded: executeScript can hang indefinitely on awkward tab states.
     markLoopProgress('ensure_cs');
     logToExtension('info', 'Background', `Ensuring content script on tab ${currentTabId}...`);
-    const csOk = await ensureTabContentScript(currentTabId);
+    const csOk = geminiTab ? true : await ensureTabContentScript(currentTabId);
     if (!csOk) {
       logToExtension('warn', 'Background', `ensureTabContentScript did not confirm injection on tab ${currentTabId}; continuing to checkPage anyway.`);
     } else {
@@ -109,9 +130,9 @@ async function startGeneration(resumeTabId) {
     // yet (a common MV3 race — "Receiving end does not exist"). Each attempt
     // is also time-bounded so a hung tabs.sendMessage cannot burn 300s.
     markLoopProgress('check_page');
-    let checkRes = null;
+    let checkRes = geminiTab ? { isSupportedPage: true, provider: 'gemini-tool' } : null;
     let checkErr = null;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 4 && !checkRes; i++) {
       if (!stillMine()) break;
       try {
         logToExtension('info', 'Background', `checkPage attempt ${i + 1}/4 on tab ${currentTabId}...`);
@@ -160,6 +181,8 @@ async function startGeneration(resumeTabId) {
 
     if (currentProvider === 'flow') {
       await runFlowSequentialGeneration(queue, delay, stillMine);
+    } else if (currentProvider === 'gemini-tool') {
+      await runToolApiGeneration(queue, stillMine);
     } else {
       // Generic provider loop (Digen, Gentube, Meta AI, Grok, ...). Runs in the
       // background no matter which tab is focused (keep-alive + background-safe
@@ -610,6 +633,104 @@ async function runFlowJob(item, jobKey, stillMine) {
   if (!stillMine()) return { ok: false, aborted: true };
   await J.markNeedsAttention(jobKey, 'Job loop guard reached without a result');
   return { ok: false, needsAttention: true, error: 'Job loop guard reached without a result' };
+}
+
+/**
+ * Gemini-hosted Bulk Generator (api engine). The extension owns the queue and the
+ * credit guard; the tool page only performs the API call and returns the image.
+ * Each prompt may be requested at most maxSubmitsPerJob times, and only after a
+ * definitive API failure. A timeout (answer unknown) is never re-requested.
+ */
+async function runToolApiGeneration(queue, stillMine) {
+  const J = globalThis.bulkygenJobs;
+  const link = globalThis.bulkygenToolLink;
+  if (!J || !link) throw new Error('Job ledger / tool link modules are not loaded');
+  const cfg = J.getConfig();
+
+  for (let i = 0; i < queue.length && stillMine(); i++) {
+    const item = queue[i];
+    if (item.status === 'completed') continue;
+    await waitWhilePaused();
+    if (!stillMine()) break;
+
+    item.status = 'processing';
+    await ext.storage.local.set({ queue, currentIndex: i });
+    notifyPopup('updateQueue', { queue });
+
+    const jobKey = flowJobKeyFor(item);
+    let out = null;
+
+    for (let turn = 0; turn < cfg.maxSubmitsPerJob + 2 && stillMine() && !out; turn++) {
+      const job = await J.ensure(jobKey, { prompt: item.prompt, aspectRatio: item.aspectRatio || null, itemId: item.id, source: 'tool' });
+      const d = J.decide(job);
+      if (d.action === 'reuse') {
+        const imgs = await loadStoredImages(job.itemId || item.id);
+        if (imgs.length) { out = { ok: true, images: imgs, reused: true }; break; }
+        await J.release(jobKey); continue;
+      }
+      const auth = await J.authorizeSubmit(jobKey, item.id, { prompt: item.prompt, aspectRatio: item.aspectRatio || null });
+      if (!auth.allowed) {
+        await J.markNeedsAttention(jobKey, auth.reason);
+        out = { ok: false, needsAttention: true, error: auth.reason };
+        break;
+      }
+      await J.noteConfirmed(jobKey, 'api_request_sent');
+      markLoopProgress('tool_api');
+      const r = await link.runApi(currentTabId, { id: item.id, prompt: item.prompt, aspectRatio: item.aspectRatio || null }, 180000);
+      if (!stillMine()) { out = { aborted: true }; break; }
+
+      if (r && r.ok && r.dataUrl) {
+        const images = [{ imageData: r.dataUrl, meta: { provider: 'gemini-tool', itemId: item.id, type: 'image' } }];
+        let saved = 0;
+        for (let t = 0; t < 3 && !saved; t++) {
+          try { await saveGeneratedImage(r.dataUrl, item.prompt, item.id, images[0].meta); saved = 1; }
+          catch (e) { await sleep(500); }
+        }
+        if (saved) await J.markCaptured(jobKey, { imageCount: 1, itemId: item.id });
+        out = { ok: true, images };
+      } else if (r && (r.timeout || r.unreachable)) {
+        // Unknown whether the API call ran. Never re-request blindly.
+        const reason = `${r.error}. Not re-requesting (it may have completed); check the tool page.`;
+        await J.markNeedsAttention(jobKey, reason);
+        out = { ok: false, needsAttention: true, error: reason };
+      } else {
+        await J.noteProvenFailure(jobKey, (r && r.error) || 'API call failed');
+        await sleep(FLOW_RETRY_BACKOFF_MS);
+      }
+    }
+
+    if (out && out.aborted) { await ext.storage.local.set({ queue }); return; }
+    if (!out) {
+      const st = await J.get(jobKey);
+      const why = (st && st.error) || 'request budget used up';
+      await J.markNeedsAttention(jobKey, why);
+      out = { ok: false, needsAttention: true, error: why };
+    }
+
+    if (out.ok) {
+      item.status = 'completed';
+      await J.recordOutcome(true);
+    } else {
+      item.status = 'error';
+      const breaker = await J.recordOutcome(false);
+      notifyPopup('generationError', { message: `Prompt ${i + 1}: ${out.error}` });
+      if (breaker.tripped) {
+        notifyPopup('generationError', { message: `Run halted: ${breaker.consecutive} jobs in a row failed (limit ${breaker.limit}).` });
+        isRunning = false;
+      }
+    }
+    if (item._pipelineRecordId && globalThis.bulkygenPipeline) {
+      try {
+        globalThis.bulkygenPipeline.deliverGenerationResult(item.id, out.ok
+          ? { success: true, imageData: out.images[0].imageData, multipleImages: out.images, meta: out.images[0].meta, reused: !!out.reused }
+          : { success: false, error: out.error, noRetry: !!out.needsAttention });
+      } catch (e) { /* ignore */ }
+    }
+    await ext.storage.local.set({ queue });
+    notifyPopup('updateQueue', { queue });
+    if (!isRunning) break;
+  }
+  await ext.storage.local.set({ queue });
 }
 
 function flowJobKeyFor(item) {

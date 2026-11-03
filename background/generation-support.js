@@ -78,43 +78,10 @@ function isSupportedTabUrl(url) {
          url.includes('flow.google.com/project/') ||
          (url.includes('meta.ai') && url.includes('/media')) ||
          (url.includes('grok.com') && url.includes('/imagine')) ||
+         url.includes('gemini.google.com/') ||   // Bulk Generator tool hosted in Gemini Canvas
          url.includes('digen.ai') ||
          (url.includes('gentube.app') && url.includes('/create')) ||
-         (url.includes('firefly.adobe.com') && url.includes('/generate')) ||
-         isGeminiShareUrl(url);
-}
-
-// When the user picked "Gemini Canvas" as their generator but has no tool tab
-// open (closed it, restarted Chrome, ...), open their saved share link in a
-// BACKGROUND tab, wait for the tool to finish loading, and hand that tab back.
-// Returns the tab id, or null if there is no saved link / the tool never loaded.
-async function openSavedGeminiToolTab() {
-  try {
-    const d = await ext.storage.local.get(['generatorChoice', 'geminiShareUrl']);
-    if (d.generatorChoice !== 'geminicanvas' || !d.geminiShareUrl) return null;
-    logToExtension('info', 'Background', 'No Gemini tool tab open; opening the saved share link in a background tab...');
-    const tab = await ext.tabs.create({ url: d.geminiShareUrl, active: false });
-    // The share page loads the tool inside a frame; waitForPageReady polls until
-    // that frame answers (only the frame holding the real tool ever replies).
-    const ready = await waitForPageReady(tab.id, 60);
-    if (!ready) {
-      logToExtension('warn', 'Background', 'The Gemini tool did not finish loading in the background tab (are you signed in to Google?).');
-      try { await ext.tabs.remove(tab.id); } catch (e) { /* ignore */ }
-      return null;
-    }
-    return tab.id;
-  } catch (e) {
-    logToExtension('warn', 'Background', 'Could not open the saved Gemini share link: ' + ((e && e.message) || e));
-    return null;
-  }
-}
-
-// A Gemini share link (https://gemini.google.com/share/<id>) or the Canvas
-// app's own host. The tool itself lives in an iframe on *.scf.usercontent.goog.
-function isGeminiShareUrl(url) {
-  if (!url) return false;
-  return /^https:\/\/gemini\.google\.com\/share\//i.test(url) ||
-         /^https:\/\/[^/]*\.?scf\.usercontent\.goog\//i.test(url);
+         (url.includes('firefly.adobe.com') && url.includes('/generate'));
 }
 
 // If startGeneration() fails before it ever reaches the per-item generation
